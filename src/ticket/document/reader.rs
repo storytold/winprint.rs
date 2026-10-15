@@ -108,12 +108,16 @@ impl PsfValueContext {
             match self.value_type.local_name.as_str() {
                 "string" => return Ok(PropertyValue::String(self.value)),
                 "integer" => {
-                    return self.value.parse().map(PropertyValue::Integer).map_err(|_| {
-                        ParsePrintSchemaError::InvalidPrintSchema {
+                    // xsd:integer collapses whitespace: drivers may emit " 16900 ".
+                    return self
+                        .value
+                        .trim()
+                        .parse()
+                        .map(PropertyValue::Integer)
+                        .map_err(|_| ParsePrintSchemaError::InvalidPrintSchema {
                             pos: self.pos,
                             reason: "Invalid integer".to_string(),
-                        }
-                    })
+                        });
                 }
                 "QName" => {
                     return Ok(PropertyValue::QName(parse_qname(
@@ -490,7 +494,7 @@ impl ParsableXmlDocument for PrintTicketDocument {
 mod tests {
     use super::{ParsableXmlDocument, ParsePrintSchemaError};
     use crate::ticket::document::{
-        PrintCapabilitiesDocument, PrintSchemaDocument, PrintTicketDocument,
+        PrintCapabilitiesDocument, PrintSchemaDocument, PrintTicketDocument, WithProperties, NS_PSF,
     };
 
     #[test]
@@ -578,5 +582,27 @@ mod tests {
     fn parse_print_capabilities() {
         let xml = include_bytes!("../../../test_data/print_capabilities.xml");
         let _document = PrintCapabilitiesDocument::parse_from_bytes(xml).unwrap();
+    }
+
+    #[test]
+    fn integer_value_with_surrounding_whitespace() {
+        // Toshiba's "Universal Printer 2" driver pads some integers, e.g. " 16900 ".
+        let xml = r#"<psf:PrintCapabilities version="1"
+    xmlns:psf="http://schemas.microsoft.com/windows/2003/08/printing/printschemaframework"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+    xmlns:psk="http://schemas.microsoft.com/windows/2003/08/printing/printschemakeywords">
+    <psf:ParameterDef name="psk:JobCopiesAllDocuments">
+        <psf:Property name="psf:MaxValue">
+            <psf:Value xsi:type="xsd:integer"> 16900 </psf:Value>
+        </psf:Property>
+    </psf:ParameterDef>
+</psf:PrintCapabilities>"#;
+        let document = PrintCapabilitiesDocument::parse_from_bytes(xml).unwrap();
+        let max_value = document.parameter_defs[0]
+            .get_property("MaxValue", Some(NS_PSF))
+            .and_then(|x| x.value.as_ref())
+            .and_then(|x| x.integer());
+        assert_eq!(max_value, Some(16900));
     }
 }
