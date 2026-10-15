@@ -10,6 +10,7 @@ permissions:
   contents: read
 jobs:
   gdi:
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
