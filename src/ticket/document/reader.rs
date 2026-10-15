@@ -108,12 +108,17 @@ impl PsfValueContext {
             match self.value_type.local_name.as_str() {
                 "string" => return Ok(PropertyValue::String(self.value)),
                 "integer" => {
-                    return self.value.parse().map(PropertyValue::Integer).map_err(|_| {
-                        ParsePrintSchemaError::InvalidPrintSchema {
+                    // XML Schema fixes the integer whitespace facet to collapse. Only XML
+                    // whitespace is allowed; internal spaces and non-XML spaces stay invalid.
+                    return self
+                        .value
+                        .trim_matches([' ', '\t', '\r', '\n'])
+                        .parse()
+                        .map(PropertyValue::Integer)
+                        .map_err(|_| ParsePrintSchemaError::InvalidPrintSchema {
                             pos: self.pos,
                             reason: "Invalid integer".to_string(),
-                        }
-                    })
+                        });
                 }
                 "QName" => {
                     return Ok(PropertyValue::QName(parse_qname(
@@ -492,6 +497,57 @@ mod tests {
     use crate::ticket::document::{
         PrintCapabilitiesDocument, PrintSchemaDocument, PrintTicketDocument,
     };
+
+    #[test]
+    fn whitespace_padded_integers_in_print_capabilities() {
+        use crate::ticket::document::PropertyValue;
+        for (value, expected) in [
+            (" 16900 ", 16900),
+            ("\t0\r\n", 0),
+            (" 100  ", 100),
+            (" -12 ", -12),
+        ] {
+            let xml = format!(
+                r#"<psf:PrintCapabilities version="1"
+                xmlns:psf="http://schemas.microsoft.com/windows/2003/08/printing/printschemaframework"
+                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                xmlns:vendor="urn:synthetic-printer">
+                <psf:ParameterDef name="vendor:Gutter"><psf:Property name="psf:MaxValue">
+                <psf:Value xsi:type="xsd:integer">{value}</psf:Value>
+                </psf:Property></psf:ParameterDef></psf:PrintCapabilities>"#
+            );
+            let doc = PrintCapabilitiesDocument::parse_from_bytes(xml).unwrap();
+            assert_eq!(
+                doc.parameter_defs[0].properties[0].value,
+                Some(PropertyValue::Integer(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_integers_are_still_rejected_and_strings_keep_spaces() {
+        use super::PsfValueContext;
+        use crate::ticket::document::{PropertyValue, NS_XSD};
+        use xml::{common::TextPosition, name::OwnedName, namespace::Namespace};
+        let context = |value: &str, kind: &str| PsfValueContext {
+            pos: TextPosition::new(),
+            value: value.to_owned(),
+            namespace: Namespace::empty(),
+            value_type: OwnedName {
+                local_name: kind.into(),
+                namespace: Some(NS_XSD.into()),
+                prefix: None,
+            },
+        };
+        for value in ["", " ", "1 2", "1.5", "2147483648", "\u{a0}12\u{a0}"] {
+            assert!(context(value, "integer").parse().is_err(), "{value:?}");
+        }
+        assert_eq!(
+            context(" padded string ", "string").parse().unwrap(),
+            PropertyValue::String(" padded string ".into())
+        );
+    }
 
     #[test]
     fn wrong_type_should_return_error() {
