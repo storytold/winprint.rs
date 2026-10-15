@@ -53,13 +53,14 @@ features = [
     "Win32_UI_WindowsAndMessaging",
 ]
 
+# Only the `pdfium` feature's build script uses these, to download and verify PDFium.
 [build-dependencies]
-reqwest = { version = "0.13", features = ["blocking"] }
-flate2 = "1.1"
-tar = "0.4"
-sigstore-trust-root = { version = "0.6.5", default-features = false }
-sigstore-types = "0.6.5"
-sigstore-verify = { version = "0.6.5", default-features = false }
+reqwest = { version = "0.13", features = ["blocking"], optional = true }
+flate2 = { version = "1.1", optional = true }
+tar = { version = "0.4", optional = true }
+sigstore-trust-root = { version = "0.6.5", default-features = false, optional = true }
+sigstore-types = { version = "0.6.5", optional = true }
+sigstore-verify = { version = "0.6.5", default-features = false, optional = true }
 
 [dev-dependencies]
 ctor = "0.10"
@@ -74,7 +75,14 @@ tiff = "0.11"
 
 [features]
 default = ["pdfium"]
-pdfium = []
+pdfium = [
+    "dep:reqwest",
+    "dep:flate2",
+    "dep:tar",
+    "dep:sigstore-trust-root",
+    "dep:sigstore-types",
+    "dep:sigstore-verify",
+]
 test-utils = ["dep:sha2", "dep:bs58", "dep:uuid"]
 
 [package.metadata.docs.rs]
