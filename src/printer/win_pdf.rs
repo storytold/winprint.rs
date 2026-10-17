@@ -11,6 +11,7 @@ use windows::Storage::StorageFile;
 use windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_F;
 use windows::Win32::System::WinRT::Pdf::PdfCreateRenderer;
 use windows::Win32::System::WinRT::Pdf::PDF_RENDER_PARAMS;
+use windows_numerics::Matrix3x2;
 
 #[derive(Error, Debug)]
 /// Represents an error from [`WinPdfPrinter`].
@@ -24,6 +25,33 @@ pub enum WinPdfPrinterError {
     /// Failed to open the document.
     #[error("Failed to open the document")]
     FailedToOpenDocument(#[source] windows::core::Error),
+    /// The page does not fit the requested resolution.
+    #[error("The page ({dips} DIPs) cannot be rendered at {scale} times its size")]
+    PageSize {
+        /// The side of the page in device-independent pixels.
+        dips: f32,
+        /// The factor of the requested resolution over 96 dpi.
+        scale: f32,
+    },
+    /// A page could not be rendered or recorded at the requested resolution.
+    ///
+    /// Direct3D 11 guarantees textures only up to 16384 texels a side
+    /// (<https://learn.microsoft.com/windows/win32/direct3d11/overviews-direct3d-11-resources-limits>)
+    /// and Direct2D printing limits a bitmap to 65535 device units
+    /// (<https://learn.microsoft.com/windows/win32/direct2d/d1163>). Neither was reached when
+    /// pages were rendered whole up to A4 at 9600 dpi, but a driver or GPU may have its own limits.
+    #[error("The page could not be rendered at {dpi} dpi ({width_px} x {height_px} px)")]
+    RenderAtResolution {
+        /// The requested resolution.
+        dpi: u32,
+        /// The page width in pixels at that resolution.
+        width_px: u32,
+        /// The page height in pixels at that resolution.
+        height_px: u32,
+        /// The failing call's error.
+        #[source]
+        source: windows::core::Error,
+    },
     /// Render error.
     #[error("Render error")]
     RenderError(#[source] windows::core::Error),
@@ -59,6 +87,26 @@ impl WinPdfPrinter {
         &self,
         path: &Path,
         options: PrintTicket,
+        progress: impl FnMut(u32, u32),
+    ) -> Result<(), WinPdfPrinterError> {
+        self.print_at(path, options, None, progress)
+    }
+}
+
+/// The resolution Direct2D (and `Windows.Data.Pdf` with it) draws a page at: 96 per inch.
+const DIP_PER_INCH: f32 = 96.0;
+
+impl WinPdfPrinter {
+    /// Print `path` rendering at `dpi`, else at the job's resolution (the DEVMODE of the ticket).
+    ///
+    /// `Windows.Data.Pdf` draws the images of a page at the destination size, 96 dpi by default
+    /// whatever the images are, so a page is rendered `dpi / 96` times larger and the transform
+    /// scales it back onto the page.
+    fn print_at(
+        &self,
+        path: &Path,
+        options: PrintTicket,
+        dpi: Option<u32>,
         mut progress: impl FnMut(u32, u32),
     ) -> Result<(), WinPdfPrinterError> {
         let context = DxgiPrintContext::new(
@@ -69,6 +117,7 @@ impl WinPdfPrinter {
         let dxgi_device = &context.dxgi_device;
         let print_control = &context.print_control;
         let d2d_context = &context.d2d_context;
+        let scale = dpi.unwrap_or(context.dpi) as f32 / DIP_PER_INCH;
         unsafe {
             let absolute_path =
                 std::path::absolute(path).map_err(WinPdfPrinterError::InvalidPath)?;
@@ -83,10 +132,6 @@ impl WinPdfPrinter {
 
             let pdf_renderer =
                 PdfCreateRenderer(dxgi_device).map_err(WinPdfPrinterError::RenderError)?;
-            let pdf_render_options = PDF_RENDER_PARAMS {
-                IgnoreHighContrast: true.into(),
-                ..Default::default()
-            };
             let page_count = pdf_document
                 .PageCount()
                 .map_err(WinPdfPrinterError::RenderError)?;
@@ -96,29 +141,52 @@ impl WinPdfPrinter {
                     .GetPage(i)
                     .map_err(WinPdfPrinterError::RenderError)?;
 
+                let pdf_size = pdf_page.Size().map_err(WinPdfPrinterError::RenderError)?;
+                let (width_px, height_px) = (
+                    scaled(pdf_size.Width, scale)?,
+                    scaled(pdf_size.Height, scale)?,
+                );
+                let at_resolution = |source| WinPdfPrinterError::RenderAtResolution {
+                    dpi: dpi.unwrap_or(context.dpi),
+                    width_px,
+                    height_px,
+                    source,
+                };
+                let pdf_render_options = PDF_RENDER_PARAMS {
+                    DestinationWidth: width_px,
+                    DestinationHeight: height_px,
+                    IgnoreHighContrast: true.into(),
+                    ..Default::default()
+                };
                 let command_list = d2d_context
                     .CreateCommandList()
                     .map_err(WinPdfPrinterError::RenderError)?;
                 d2d_context.SetTarget(&command_list);
                 d2d_context.BeginDraw();
-                pdf_renderer
-                    .RenderPageToDeviceContext(&pdf_page, d2d_context, Some(&pdf_render_options))
-                    .map_err(WinPdfPrinterError::RenderError)?;
-                d2d_context
-                    .EndDraw(None, None)
-                    .map_err(WinPdfPrinterError::RenderError)?;
+                d2d_context.SetTransform(&Matrix3x2 {
+                    M11: 1.0 / scale,
+                    M22: 1.0 / scale,
+                    ..Matrix3x2::identity()
+                });
+                let rendered = pdf_renderer.RenderPageToDeviceContext(
+                    &pdf_page,
+                    d2d_context,
+                    Some(&pdf_render_options),
+                );
+                d2d_context.SetTransform(&Matrix3x2::identity());
+                rendered.map_err(at_resolution)?;
+                d2d_context.EndDraw(None, None).map_err(at_resolution)?;
                 command_list
                     .Close()
                     .map_err(WinPdfPrinterError::RenderError)?;
 
-                let pdf_size = pdf_page.Size().map_err(WinPdfPrinterError::RenderError)?;
                 let dx_size = D2D_SIZE_F {
                     width: pdf_size.Width as f32,
                     height: pdf_size.Height as f32,
                 };
                 print_control
                     .AddPage(&command_list, dx_size, None, None, None)
-                    .map_err(WinPdfPrinterError::RenderError)?;
+                    .map_err(at_resolution)?;
                 progress(i + 1, page_count);
             }
         }
@@ -127,9 +195,19 @@ impl WinPdfPrinter {
     }
 }
 
+/// A page side in pixels at `scale` times its size in DIPs.
+fn scaled(dips: f32, scale: f32) -> Result<u32, WinPdfPrinterError> {
+    let pixels = (dips * scale).ceil();
+    if pixels >= 1.0 && pixels < u32::MAX as f32 {
+        Ok(pixels as u32)
+    } else {
+        Err(WinPdfPrinterError::PageSize { dips, scale })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::WinPdfPrinter;
+    use super::{scaled, WinPdfPrinter};
     use crate::{printer::FilePrinter, test_utils::null_device};
     use std::path::Path;
 
@@ -139,5 +217,26 @@ mod tests {
         let pdf = WinPdfPrinter::new(device);
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_data/test_document.pdf");
         pdf.print(path.as_path(), Default::default()).unwrap();
+    }
+
+    /// A4 at 1600 dpi is 13229 x 18709 px, taller than the 16384 texels Direct3D 11 allows a
+    /// texture. The page is still rendered whole, in one pass: `RenderPageToDeviceContext` records
+    /// into a command list and never allocates a page-sized texture.
+    #[test]
+    fn a_page_larger_than_a_texture_prints_at_a_high_resolution() {
+        let device = null_device::thread_local();
+        let pdf = WinPdfPrinter::new(device);
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_data/test_document.pdf");
+        pdf.print_at(path.as_path(), Default::default(), Some(1600), |_, _| {})
+            .unwrap();
+    }
+
+    #[test]
+    fn a_page_side_is_scaled_and_never_overflows() {
+        assert_eq!(scaled(793.7, 1600.0 / 96.0).unwrap(), 13229);
+        assert_eq!(scaled(1122.5, 1.0).unwrap(), 1123);
+        assert!(scaled(0.0, 1.0).is_err());
+        assert!(scaled(f32::NAN, 1.0).is_err());
+        assert!(scaled(1e12, 100.0).is_err());
     }
 }
