@@ -33,6 +33,25 @@ pub enum WinPdfPrinterError {
         /// The factor of the requested resolution over 96 dpi.
         scale: f32,
     },
+    /// A page could not be rendered or recorded at the requested resolution.
+    ///
+    /// Direct3D 11 guarantees textures only up to 16384 texels a side
+    /// (<https://learn.microsoft.com/windows/win32/direct3d11/overviews-direct3d-11-resources-limits>)
+    /// and Direct2D printing limits a bitmap to 65535 device units
+    /// (<https://learn.microsoft.com/windows/win32/direct2d/d1163>). Neither was reached when
+    /// pages were rendered whole up to A4 at 9600 dpi, but a driver or GPU may have its own limits.
+    #[error("The page could not be rendered at {dpi} dpi ({width_px} x {height_px} px)")]
+    RenderAtResolution {
+        /// The requested resolution.
+        dpi: u32,
+        /// The page width in pixels at that resolution.
+        width_px: u32,
+        /// The page height in pixels at that resolution.
+        height_px: u32,
+        /// The failing call's error.
+        #[source]
+        source: windows::core::Error,
+    },
     /// Render error.
     #[error("Render error")]
     RenderError(#[source] windows::core::Error),
@@ -123,9 +142,19 @@ impl WinPdfPrinter {
                     .map_err(WinPdfPrinterError::RenderError)?;
 
                 let pdf_size = pdf_page.Size().map_err(WinPdfPrinterError::RenderError)?;
+                let (width_px, height_px) = (
+                    scaled(pdf_size.Width, scale)?,
+                    scaled(pdf_size.Height, scale)?,
+                );
+                let at_resolution = |source| WinPdfPrinterError::RenderAtResolution {
+                    dpi: dpi.unwrap_or(context.dpi),
+                    width_px,
+                    height_px,
+                    source,
+                };
                 let pdf_render_options = PDF_RENDER_PARAMS {
-                    DestinationWidth: scaled(pdf_size.Width, scale)?,
-                    DestinationHeight: scaled(pdf_size.Height, scale)?,
+                    DestinationWidth: width_px,
+                    DestinationHeight: height_px,
                     IgnoreHighContrast: true.into(),
                     ..Default::default()
                 };
@@ -145,10 +174,8 @@ impl WinPdfPrinter {
                     Some(&pdf_render_options),
                 );
                 d2d_context.SetTransform(&Matrix3x2::identity());
-                rendered.map_err(WinPdfPrinterError::RenderError)?;
-                d2d_context
-                    .EndDraw(None, None)
-                    .map_err(WinPdfPrinterError::RenderError)?;
+                rendered.map_err(at_resolution)?;
+                d2d_context.EndDraw(None, None).map_err(at_resolution)?;
                 command_list
                     .Close()
                     .map_err(WinPdfPrinterError::RenderError)?;
@@ -159,7 +186,7 @@ impl WinPdfPrinter {
                 };
                 print_control
                     .AddPage(&command_list, dx_size, None, None, None)
-                    .map_err(WinPdfPrinterError::RenderError)?;
+                    .map_err(at_resolution)?;
                 progress(i + 1, page_count);
             }
         }
