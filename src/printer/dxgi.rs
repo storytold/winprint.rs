@@ -97,6 +97,22 @@ impl DxgiPrintContext {
         options: &PrintTicket,
         job_name: &OsStr,
     ) -> Result<Self, DxgiPrintContextError> {
+        Self::new_with_ticket_hook(device, options, job_name, || {})
+    }
+
+    /// Create a new print context, like [`DxgiPrintContext::new`], and call `ticket_converted`
+    /// once the print ticket has been converted to a `DEVMODE`.
+    ///
+    /// The conversion is the only step here that opens a PrintTicket provider. `ticket_converted`
+    /// runs on the calling thread after that provider is closed, before Direct3D, Direct2D and
+    /// the spooler job are set up. If the conversion fails, the error is returned and
+    /// `ticket_converted` is dropped without being called.
+    pub fn new_with_ticket_hook(
+        device: &PrinterDevice,
+        options: &PrintTicket,
+        job_name: &OsStr,
+        ticket_converted: impl FnOnce(),
+    ) -> Result<Self, DxgiPrintContextError> {
         // Initialize COM before calling any COM functions.
         let _com_initializer = ComInitializer::new();
         unsafe {
@@ -126,6 +142,7 @@ impl DxgiPrintContext {
                     (None, None) => DEFAULT_DPI,
                 }
             };
+            ticket_converted();
             let mut d3d_device: Option<ID3D11Device> = None;
             let mut d3d_context: Option<ID3D11DeviceContext> = None;
             D3D11CreateDevice(

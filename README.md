@@ -80,6 +80,11 @@ The narrow changes used by craft-print are:
   Existing `FilePrinter::print` remains a wrapper without progress.
 - Completion regression tests cover a late failed HRESULT, cancellation, inconsistent
   completed HRESULT, missing notification, and repeated terminal notifications.
+- `WinPdfPrinter::print_with_progress_and_ticket_hook(path, ticket, ticket_converted,
+  callback)` and `DxgiPrintContext::new_with_ticket_hook` also call `ticket_converted`
+  once the ticket has been converted to a `DEVMODE`, after the PrintTicket provider is
+  closed and before the spooler job is created. `print_with_progress` and
+  `DxgiPrintContext::new` are unchanged.
 
 The shared completion state uses reference-counted Rust synchronization rather than
 an event HANDLE borrowed from the callback's lifetime. Applications must still check
