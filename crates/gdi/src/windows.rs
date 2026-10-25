@@ -250,9 +250,13 @@ impl Dc {
             );
         }
         if manual_copies && !merged.as_ref().is_some_and(DevMode::has_manual_copies) {
-            return Err(PrintError::Invalid(
-                "the driver refused single-copy settings; no print job was sent".into(),
-            ));
+            let kept = merged.as_ref().and_then(DevMode::driver_copies);
+            return Err(PrintError::Invalid(match kept {
+                Some(n) => format!(
+                    "the driver kept its own copy count ({n}) instead of one; set Copies to 1 in Print Settings… and choose the copies here. No print job was sent"
+                ),
+                None => "the driver refused single-copy settings; no print job was sent".into(),
+            }));
         }
         let dm = merged.as_ref().map(aligned_copy);
         let dmp: *const DEVMODEW = dm.as_ref().map_or(null(), |b| b.as_ptr().cast());
