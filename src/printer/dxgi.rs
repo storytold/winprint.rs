@@ -273,3 +273,44 @@ impl Drop for DxgiPrintContext {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{DxgiPrintContext, DxgiPrintContextError};
+    use crate::{test_utils::null_device, ticket::PrintTicket};
+    use std::cell::Cell;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn ticket_hook_runs_once_when_the_ticket_converts() {
+        let device = null_device::thread_local();
+        let calls = Cell::new(0);
+        let context = DxgiPrintContext::new_with_ticket_hook(
+            &device,
+            &PrintTicket::default(),
+            OsStr::new("ticket hook test"),
+            || calls.set(calls.get() + 1),
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        drop(context);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn ticket_hook_is_not_called_when_the_conversion_fails() {
+        let device = null_device::thread_local();
+        let calls = Cell::new(0);
+        let result = DxgiPrintContext::new_with_ticket_hook(
+            &device,
+            &PrintTicket::from_xml("not a print ticket"),
+            OsStr::new("ticket hook test"),
+            || calls.set(calls.get() + 1),
+        );
+        assert!(matches!(
+            result,
+            Err(DxgiPrintContextError::PrintTicketError(_))
+        ));
+        assert_eq!(calls.get(), 0);
+    }
+}
