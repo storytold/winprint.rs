@@ -120,23 +120,42 @@ impl PrintTicket {
                 let _ = ClosePrinter(printer_handle);
             }
 
-            // The per-user settings, when there are any and this session is served them.
+            // The per-user settings, when there are any and this session is served them. The
+            // read is made again at the size it asks for when they grew after the size query (the
+            // user saving Printing Preferences meanwhile), a few times at most, and they are used
+            // only when they lie wholly within what was read.
             let mut needed = 0u32;
             let _ = GetPrinterW(printer_handle, 9, None, ptr::addr_of_mut!(needed));
-            let mut info = vec![0u8; needed as usize];
-            let per_user: *const DEVMODEW = if info.len() >= std::mem::size_of::<PRINTER_INFO_9W>()
-                && GetPrinterW(
+            // Lives until the end: `per_user` points into it.
+            let mut info: Vec<u8>;
+            let mut per_user: *const DEVMODEW = ptr::null();
+            for _ in 0..3 {
+                let size = needed as usize;
+                if size < std::mem::size_of::<PRINTER_INFO_9W>() || size > MAX_PRINTER_INFO {
+                    break;
+                }
+                info = vec![0u8; size];
+                if GetPrinterW(
                     printer_handle,
                     9,
                     Some(&mut info),
                     ptr::addr_of_mut!(needed),
                 )
                 .is_ok()
-            {
-                ptr::read_unaligned(info.as_ptr() as *const PRINTER_INFO_9W).pDevMode
-            } else {
-                ptr::null()
-            };
+                {
+                    let at = ptr::read_unaligned(info.as_ptr() as *const PRINTER_INFO_9W).pDevMode;
+                    if (at as usize)
+                        .checked_sub(info.as_ptr() as usize)
+                        .is_some_and(|offset| dev_mode_within(&info, offset))
+                    {
+                        per_user = at;
+                    }
+                    break;
+                }
+                if needed as usize <= size {
+                    break;
+                }
+            }
 
             let size = DocumentPropertiesW(
                 None,
@@ -299,10 +318,67 @@ impl From<PrintTicketDocument> for PrintTicket {
     }
 }
 
+/// The most a GetPrinter level 9 answer is read at: larger ones are not a user's settings.
+const MAX_PRINTER_INFO: usize = 1 << 20;
+/// The smallest DEVMODEW a driver writes (Windows 95's, up to `dmICMIntent`).
+const MIN_DEV_MODE: usize = 156;
+
+/// Whether `buf` holds a whole DEVMODEW at `offset`: as many bytes as its own `dmSize` and
+/// `dmDriverExtra` say, `dmSize` at least the smallest a driver writes.
+fn dev_mode_within(buf: &[u8], offset: usize) -> bool {
+    let field = |at: usize| {
+        let at = offset.checked_add(at)?;
+        buf.get(at..at.checked_add(2)?)
+            .map(|w| usize::from(u16::from_le_bytes([w[0], w[1]])))
+    };
+    match (field(68), field(70)) {
+        (Some(size), Some(extra)) => {
+            size >= MIN_DEV_MODE
+                && offset
+                    .checked_add(size + extra)
+                    .is_some_and(|end| end <= buf.len())
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::PrintTicket;
+    use super::{dev_mode_within, PrintTicket};
     use crate::test_utils::null_device;
+
+    /// A GetPrinter level 9 answer: a header, then a DEVMODEW with `size` public and `extra`
+    /// private bytes.
+    fn answer(header: usize, size: u16, extra: u16) -> Vec<u8> {
+        let mut buf = vec![0u8; header + usize::from(size) + usize::from(extra)];
+        buf[header + 68..header + 70].copy_from_slice(&size.to_le_bytes());
+        buf[header + 70..header + 72].copy_from_slice(&extra.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn the_users_settings_are_used_only_when_wholly_within_the_answer() {
+        let buf = answer(8, 220, 1200);
+        assert!(dev_mode_within(&buf, 8));
+        assert!(
+            !dev_mode_within(&buf[..buf.len() - 1], 8),
+            "a private part cut short"
+        );
+        assert!(!dev_mode_within(&buf, buf.len()), "settings at the end");
+        assert!(
+            !dev_mode_within(&buf, usize::MAX),
+            "an offset past any buffer"
+        );
+        assert!(!dev_mode_within(&[], 0), "no answer");
+        assert!(
+            !dev_mode_within(&answer(8, 100, 0), 8),
+            "too small to be settings"
+        );
+        assert!(
+            dev_mode_within(&answer(0, 220, u16::MAX), 0),
+            "the largest private part"
+        );
+    }
 
     #[test]
     fn the_user_default_ticket_is_a_complete_job_ticket() {
