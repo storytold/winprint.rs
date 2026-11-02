@@ -83,6 +83,21 @@ impl DevMode {
         &self.0
     }
 
+    /// The settings a spooler buffer holds at `offset` (where its `pDevMode` points, from the
+    /// buffer's start), as many bytes as their own `dmSize` and `dmDriverExtra` say. `None` when
+    /// that runs past the buffer or the settings fail [`DevMode::from_bytes`].
+    #[cfg(any(windows, test))]
+    pub(crate) fn in_buffer(buf: &[u8], offset: usize) -> Option<Self> {
+        let word = |at: usize| {
+            let at = offset.checked_add(at)?;
+            buf.get(at..at.checked_add(2)?)
+                .map(|w| usize::from(u16::from_le_bytes([w[0], w[1]])))
+        };
+        let len = word(DM_SIZE_AT)?.checked_add(word(DM_EXTRA_AT)?)?;
+        let bytes = buf.get(offset..offset.checked_add(len)?)?;
+        DevMode::from_bytes(bytes.to_vec()).ok()
+    }
+
     /// The application emits every copy as a page. Disable driver copies/collation too,
     /// preserving the driver's private settings and all other public fields.
     #[cfg(any(windows, test))]
@@ -428,6 +443,35 @@ mod tests {
         for bad in ["", "abc", "zz", &"00".repeat(300)] {
             assert!(DevMode::from_hex(bad).is_err(), "{bad}");
         }
+    }
+
+    /// The user's settings as GetPrinter level 9 returns them: a PRINTER_INFO_9W whose
+    /// `pDevMode` points further into the same buffer.
+    #[test]
+    fn settings_are_read_from_a_spooler_buffer_only_within_it() {
+        let settings = devmode(220, 1200);
+        let mut buf = vec![0xa5u8; 8];
+        buf.extend_from_slice(&settings);
+        assert_eq!(
+            DevMode::in_buffer(&buf, 8),
+            Some(DevMode::from_bytes(settings.clone()).unwrap())
+        );
+        // A driver's private part past the end of the buffer, or an offset past it.
+        assert_eq!(DevMode::in_buffer(&buf[..buf.len() - 1], 8), None);
+        assert_eq!(DevMode::in_buffer(&buf, buf.len()), None);
+        assert_eq!(DevMode::in_buffer(&buf, usize::MAX), None);
+        // An empty buffer, and settings whose own sizes are too small to be settings.
+        assert_eq!(DevMode::in_buffer(&[], 0), None);
+        let mut short = vec![0u8; 8];
+        short.extend_from_slice(&devmode(100, 0));
+        assert_eq!(DevMode::in_buffer(&short, 8), None);
+        // The largest private part a header can describe is read whole, and nothing after it.
+        let mut big = devmode(220, u16::MAX);
+        big.extend_from_slice(&[0xa5; 16]);
+        assert_eq!(
+            DevMode::in_buffer(&big, 0).map(|d| d.as_bytes().len()),
+            Some(220 + usize::from(u16::MAX))
+        );
     }
 
     #[test]

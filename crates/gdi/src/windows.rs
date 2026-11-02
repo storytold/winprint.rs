@@ -220,35 +220,36 @@ pub fn user_settings(printer: &str) -> Result<DevMode> {
         let mut needed = 0u32;
         // SAFETY: a size query (null buffer, 0 bytes) on a valid printer handle.
         unsafe { GetPrinterW(p.0, 9, null_mut(), 0, &mut needed) };
-        let bytes = needed as usize;
-        if bytes >= std::mem::size_of::<PRINTER_INFO_9W>() && bytes <= (1 << 20) {
+        // The settings can grow between the size query and the read (the user saves Printing
+        // Preferences meanwhile): the read then fails asking for more, and is made again at the
+        // new size, a few times at most. Anything else falls back to the printer's defaults.
+        let mut found = None;
+        for _ in 0..3 {
+            let bytes = needed as usize;
+            if bytes < std::mem::size_of::<PRINTER_INFO_9W>() || bytes > (1 << 20) {
+                break;
+            }
             let mut buf = aligned(bytes);
             // SAFETY: `buf` holds `needed` aligned writable bytes as the size query asked for.
             let ok =
                 unsafe { GetPrinterW(p.0, 9, buf.as_mut_ptr().cast(), needed, &mut needed) } != 0;
-            if ok {
-                // SAFETY: on success the buffer starts with a PRINTER_INFO_9W (aligned buffer).
-                let dm = unsafe { (*buf.as_ptr().cast::<PRINTER_INFO_9W>()).pDevMode };
-                if dm.is_null() {
-                    None
-                } else {
-                    // SAFETY: a non-null pDevMode points into `buf` at a DEVMODEW the spooler
-                    // wrote; its dmSize and dmDriverExtra say how many bytes it has.
-                    let (size, extra) =
-                        unsafe { (usize::from((*dm).dmSize), usize::from((*dm).dmDriverExtra)) };
-                    let base = buf.as_ptr() as usize;
-                    let at = dm as usize;
-                    let all = bytes_of(&buf, bytes);
-                    at.checked_sub(base)
-                        .and_then(|off| all.get(off..off.checked_add(size + extra)?))
-                        .and_then(|b| DevMode::from_bytes(b.to_vec()).ok())
+            if !ok {
+                if needed as usize > bytes {
+                    continue;
                 }
-            } else {
-                None
+                break;
             }
-        } else {
-            None
+            // SAFETY: on success the buffer starts with a PRINTER_INFO_9W (aligned buffer).
+            let dm = unsafe { (*buf.as_ptr().cast::<PRINTER_INFO_9W>()).pDevMode };
+            // A non-null pDevMode points into `buf`; the settings are read from the buffer's own
+            // bytes, within it, and never through the pointer.
+            found = (dm as usize)
+                .checked_sub(buf.as_ptr() as usize)
+                .filter(|_| !dm.is_null())
+                .and_then(|offset| DevMode::in_buffer(&bytes_of(&buf, bytes), offset));
+            break;
         }
+        found
     };
     match per_user {
         Some(d) => properties(printer, Some(&d), None, false)?,
