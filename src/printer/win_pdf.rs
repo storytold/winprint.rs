@@ -59,12 +59,32 @@ impl WinPdfPrinter {
         &self,
         path: &Path,
         options: PrintTicket,
+        progress: impl FnMut(u32, u32),
+    ) -> Result<(), WinPdfPrinterError> {
+        self.print_with_progress_and_ticket_hook(path, options, || {}, progress)
+    }
+
+    /// Print one PDF like [`WinPdfPrinter::print_with_progress`], and call `ticket_converted`
+    /// once the print ticket has been converted to a `DEVMODE`.
+    ///
+    /// `ticket_converted` runs once, on the calling thread, before the first `progress` call.
+    /// The job opens a PrintTicket provider only for that conversion, and closes it before
+    /// `ticket_converted` runs. A caller that allows one thread at a time into the PrintTicket
+    /// provider can release its lock there instead of holding it while the job is set up and
+    /// the document is opened. If the conversion fails,
+    /// the error is returned and `ticket_converted` is dropped without being called.
+    pub fn print_with_progress_and_ticket_hook(
+        &self,
+        path: &Path,
+        options: PrintTicket,
+        ticket_converted: impl FnOnce(),
         mut progress: impl FnMut(u32, u32),
     ) -> Result<(), WinPdfPrinterError> {
-        let context = DxgiPrintContext::new(
+        let context = DxgiPrintContext::new_with_ticket_hook(
             &self.printer,
             &options,
             path.file_name().unwrap_or(path.as_ref()),
+            ticket_converted,
         )?;
         let dxgi_device = &context.dxgi_device;
         let print_control = &context.print_control;
@@ -131,7 +151,27 @@ impl WinPdfPrinter {
 mod tests {
     use super::WinPdfPrinter;
     use crate::{printer::FilePrinter, test_utils::null_device};
+    use std::cell::RefCell;
     use std::path::Path;
+
+    #[test]
+    fn ticket_hook_runs_once_before_the_first_progress_report() {
+        let device = null_device::thread_local();
+        let pdf = WinPdfPrinter::new(device);
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_data/test_document.pdf");
+        let events = RefCell::new(Vec::new());
+        pdf.print_with_progress_and_ticket_hook(
+            path.as_path(),
+            Default::default(),
+            || events.borrow_mut().push(None),
+            |processed, total| events.borrow_mut().push(Some((processed, total))),
+        )
+        .unwrap();
+        let events = events.into_inner();
+        assert_eq!(events.first(), Some(&None));
+        assert_eq!(events.iter().filter(|e| e.is_none()).count(), 1);
+        assert_eq!(events.get(1), Some(&Some((0, events.len() as u32 - 2))));
+    }
 
     #[test]
     fn print_simple_pdf_document() {

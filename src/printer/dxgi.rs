@@ -97,6 +97,22 @@ impl DxgiPrintContext {
         options: &PrintTicket,
         job_name: &OsStr,
     ) -> Result<Self, DxgiPrintContextError> {
+        Self::new_with_ticket_hook(device, options, job_name, || {})
+    }
+
+    /// Create a new print context, like [`DxgiPrintContext::new`], and call `ticket_converted`
+    /// once the print ticket has been converted to a `DEVMODE`.
+    ///
+    /// The conversion is the only step here that opens a PrintTicket provider. `ticket_converted`
+    /// runs on the calling thread after that provider is closed, before Direct3D, Direct2D and
+    /// the spooler job are set up. If the conversion fails, the error is returned and
+    /// `ticket_converted` is dropped without being called.
+    pub fn new_with_ticket_hook(
+        device: &PrinterDevice,
+        options: &PrintTicket,
+        job_name: &OsStr,
+        ticket_converted: impl FnOnce(),
+    ) -> Result<Self, DxgiPrintContextError> {
         // Initialize COM before calling any COM functions.
         let _com_initializer = ComInitializer::new();
         unsafe {
@@ -126,6 +142,7 @@ impl DxgiPrintContext {
                     (None, None) => DEFAULT_DPI,
                 }
             };
+            ticket_converted();
             let mut d3d_device: Option<ID3D11Device> = None;
             let mut d3d_context: Option<ID3D11DeviceContext> = None;
             D3D11CreateDevice(
@@ -257,5 +274,46 @@ impl Drop for DxgiPrintContext {
             // Release the event sink while the COM apartment is still initialized.
             let _ = self.status_connection.Unadvise(self.status_cookie);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DxgiPrintContext, DxgiPrintContextError};
+    use crate::{test_utils::null_device, ticket::PrintTicket};
+    use std::cell::Cell;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn ticket_hook_runs_once_when_the_ticket_converts() {
+        let device = null_device::thread_local();
+        let calls = Cell::new(0);
+        let context = DxgiPrintContext::new_with_ticket_hook(
+            &device,
+            &PrintTicket::default(),
+            OsStr::new("ticket hook test"),
+            || calls.set(calls.get() + 1),
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        drop(context);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn ticket_hook_is_not_called_when_the_conversion_fails() {
+        let device = null_device::thread_local();
+        let calls = Cell::new(0);
+        let result = DxgiPrintContext::new_with_ticket_hook(
+            &device,
+            &PrintTicket::from_xml("not a print ticket"),
+            OsStr::new("ticket hook test"),
+            || calls.set(calls.get() + 1),
+        );
+        assert!(matches!(
+            result,
+            Err(DxgiPrintContextError::PrintTicketError(_))
+        ));
+        assert_eq!(calls.get(), 0);
     }
 }
