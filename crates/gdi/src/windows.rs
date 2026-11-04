@@ -168,6 +168,25 @@ fn aligned_copy(settings: &DevMode) -> Vec<u64> {
     buf
 }
 
+/// The buffer `DocumentPropertiesW` writes settings into, for a driver that asked for `needed`
+/// bytes. Some drivers write more than the size they report, which would run past an exact
+/// buffer, so this leaves the same room as `PrintTicket::to_dev_mode` in winprint's ticket code.
+fn settings_capacity(needed: usize) -> usize {
+    needed.saturating_mul(2).saturating_add(8192)
+}
+
+/// The settings a driver wrote into `out`: its `dmSize` and `dmDriverExtra` bytes, cut at the
+/// buffer's `capacity`. Settings that don't fit are refused as damaged by [`DevMode::from_bytes`].
+fn written_settings(out: &[u64], capacity: usize) -> Result<DevMode> {
+    let all = bytes_of(out, capacity);
+    let word = |at: usize| {
+        all.get(at..at + 2)
+            .map_or(0, |w| usize::from(u16::from_le_bytes([w[0], w[1]])))
+    };
+    let len = (word(68) + word(70)).min(all.len());
+    DevMode::from_bytes(all.into_iter().take(len).collect())
+}
+
 pub fn properties(
     printer: &str,
     current: Option<&DevMode>,
@@ -182,7 +201,8 @@ pub fn properties(
     if needed <= 0 || needed as usize > (1 << 20) {
         return Err(last_error("reading the printer's settings"));
     }
-    let mut out = aligned(needed as usize);
+    let capacity = settings_capacity(needed as usize);
+    let mut out = aligned(capacity);
     let input = current.map(aligned_copy);
     let mut mode = DM_OUT_BUFFER;
     if input.is_some() {
@@ -192,21 +212,14 @@ pub fn properties(
         mode |= DM_IN_PROMPT;
     }
     let inp: *const DEVMODEW = input.as_ref().map_or(null(), |b| b.as_ptr().cast());
-    // SAFETY: `out` holds `needed` aligned writable bytes as the size query asked for; `inp` is
-    // null or an aligned copy of settings written by this printer's driver.
+    // SAFETY: `out` holds `capacity` aligned writable bytes, more than the size query asked for
+    // (see `settings_capacity`); `inp` is null or an aligned copy of settings written by this
+    // printer's driver.
     let r = unsafe {
         DocumentPropertiesW(hwnd, p.0, name.as_ptr(), out.as_mut_ptr().cast(), inp, mode)
     };
     match r {
-        IDOK => {
-            let all = bytes_of(&out, needed as usize);
-            let word = |at: usize| {
-                all.get(at..at + 2)
-                    .map_or(0, |w| usize::from(u16::from_le_bytes([w[0], w[1]])))
-            };
-            let len = (word(68) + word(70)).min(all.len());
-            DevMode::from_bytes(all.into_iter().take(len).collect()).map(Some)
-        }
+        IDOK => written_settings(&out, capacity).map(Some),
         IDCANCEL => Ok(None),
         _ => Err(last_error("the printer's settings dialog")),
     }
@@ -560,6 +573,32 @@ mod tests {
             bytes_of(&buf, b.len()),
             b,
             "no name check, no truncation: the bytes go through as chosen"
+        );
+    }
+
+    /// A driver that asked for 220 bytes but wrote 220 public and 40 private ones: the buffer has
+    /// room for them, and the settings come back whole instead of cut at 220 and refused.
+    #[test]
+    fn settings_longer_than_the_driver_reported_are_kept() {
+        let needed = 220;
+        let mut written: Vec<u8> = (0..260u32).map(|i| (i * 3) as u8).collect();
+        written[68..70].copy_from_slice(&220u16.to_le_bytes());
+        written[70..72].copy_from_slice(&40u16.to_le_bytes());
+        let capacity = settings_capacity(needed);
+        assert!(capacity >= 2 * needed);
+        let mut out = aligned(capacity);
+        for (slot, chunk) in out.iter_mut().zip(written.chunks(8)) {
+            let mut w = [0u8; 8];
+            w[..chunk.len()].copy_from_slice(chunk);
+            *slot = u64::from_le_bytes(w);
+        }
+        assert_eq!(
+            written_settings(&out, capacity).unwrap().as_bytes(),
+            &written[..]
+        );
+        assert!(
+            written_settings(&out, needed).is_err(),
+            "cut at the reported size, they no longer add up"
         );
     }
 
