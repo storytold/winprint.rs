@@ -256,6 +256,9 @@ impl XmlSerializer for super::PropertyValue {
         ns.put("psf", NS_PSF);
         ns.put("xsi", NS_XSI);
         collect_namespace_from_name(&self.xsi_type(), ns);
+        if let super::PropertyValue::QName(q) = self {
+            collect_namespace_from_name(q, ns);
+        }
     }
 
     fn write_to<W: Write>(&self, writer: &mut EventWriter<W>) -> Result<(), xml::writer::Error> {
@@ -270,8 +273,10 @@ impl XmlSerializer for super::PropertyValue {
             super::PropertyValue::Integer(i) => {
                 writer.write(XmlEvent::characters(&i.to_string()))?;
             }
+            // `OwnedName`'s `Display` prefixes the namespace URI (`{uri}psk:Name`), which is not
+            // a valid QName, so drivers reject the ticket.
             super::PropertyValue::QName(q) => {
-                writer.write(XmlEvent::characters(&q.to_string()))?;
+                writer.write(XmlEvent::characters(format_name(q).as_ref()))?;
             }
             super::PropertyValue::Unknown(_, s) => {
                 writer.write(XmlEvent::characters(s))?;
@@ -336,5 +341,28 @@ mod tests {
         let document = PrintCapabilitiesDocument::parse_from_bytes(&xml1).unwrap();
         let xml2 = document.to_xml();
         assert_eq!(xml1, xml2);
+    }
+
+    #[test]
+    fn serialize_qname_value_as_prefixed_name() {
+        // As the Microsoft IPP Class Driver lists Letter (storytold/pdfcraft#3823).
+        let origin = br#"<psf:PrintTicket version="1" xmlns:psf="http://schemas.microsoft.com/windows/2003/08/printing/printschemaframework" xmlns:psk="http://schemas.microsoft.com/windows/2003/08/printing/printschemakeywords" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:ns0003="http://schemas.microsoft.com/windows/2013/12/printing/printschemaframework2" xmlns:ns0004="urn:only-used-in-a-value">
+    <psf:Feature name="psk:PageMediaSize">
+        <psf:Option name="psk:NorthAmericaLetter">
+            <psf:Property name="ns0003:feedDirectionOverride">
+                <psf:Value xsi:type="xsd:QName">psk:LongEdgeFirst</psf:Value>
+            </psf:Property>
+            <psf:Property name="psk:DisplayName">
+                <psf:Value xsi:type="xsd:QName">ns0004:Letter</psf:Value>
+            </psf:Property>
+        </psf:Option>
+    </psf:Feature>
+</psf:PrintTicket>"#;
+        let document = PrintTicketDocument::parse_from_bytes(origin).unwrap();
+        let xml = String::from_utf8(document.to_xml()).unwrap();
+        assert!(xml.contains(">psk:LongEdgeFirst<"), "{xml}");
+        assert!(xml.contains(">ns0004:Letter<"), "{xml}");
+        assert!(xml.contains(r#"xmlns:ns0004="urn:only-used-in-a-value""#), "{xml}");
+        assert!(!xml.contains('{'), "{xml}");
     }
 }
