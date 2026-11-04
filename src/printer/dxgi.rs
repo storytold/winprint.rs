@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Direct2D::ID2D1Factory1;
 use windows::Win32::Graphics::Direct2D::ID2D1PrintControl;
 use windows::Win32::Graphics::Direct2D::D2D1_DEVICE_CONTEXT_OPTIONS_NONE;
 use windows::Win32::Graphics::Direct2D::D2D1_FACTORY_OPTIONS;
-use windows::Win32::Graphics::Direct2D::D2D1_FACTORY_TYPE_SINGLE_THREADED;
+use windows::Win32::Graphics::Direct2D::D2D1_FACTORY_TYPE_MULTI_THREADED;
 use windows::Win32::Graphics::Direct2D::D2D1_PRINT_CONTROL_PROPERTIES;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::D3D11CreateDevice;
@@ -151,8 +151,11 @@ impl DxgiPrintContext {
                 .map_err(DxgiPrintContextError::InitializeDirectX)?;
 
             let d2d_factory_options = D2D1_FACTORY_OPTIONS::default();
+            // Windows.Data.Pdf renders a page on several worker threads that share this
+            // device context. A single-threaded factory has no locking, so they race inside
+            // d2d1.dll (access violations reading near null or calling freed memory).
             let d2d_factory: ID2D1Factory1 = D2D1CreateFactory(
-                D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                D2D1_FACTORY_TYPE_MULTI_THREADED,
                 Some(&d2d_factory_options),
             )
             .map_err(DxgiPrintContextError::InitializeDirectX)?;
