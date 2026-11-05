@@ -358,6 +358,105 @@ pub fn print(job: &Job<'_>, image: &RgbImage<'_>, rect: (f64, f64, f64, f64)) ->
     }
 }
 
+/// One sheet for [`print_postscript`].
+#[derive(Clone, Copy, Debug)]
+pub struct PostScriptSheet<'a> {
+    /// The sheet as Encapsulated PostScript in points from its own lower-left corner, as
+    /// Ghostscript's `eps2write` writes it. `showpage` in it is ignored.
+    pub eps: &'a [u8],
+    /// The sheet's width and height in points.
+    pub size: (f64, f64),
+    /// Where it is drawn: (x, y, width, height) in points from the paper's top-left corner.
+    pub rect: (f64, f64, f64, f64),
+}
+
+/// A PostScript job. The driver applies `settings` as they are (paper, orientation, copies,
+/// collation, two-sided, finishing): it makes the copies, so a two-sided job's copies each start
+/// on a new sheet.
+#[derive(Clone, Copy, Debug)]
+pub struct PostScriptJob<'a> {
+    pub printer: &'a str,
+    pub settings: Option<&'a DevMode>,
+    /// The name in the print queue.
+    pub title: &'a str,
+    /// Print to this file instead of the device (drivers that write files, and tests).
+    pub output_file: Option<&'a str>,
+}
+
+/// Whether `printer`'s driver passes PostScript through to the printer
+/// (`POSTSCRIPT_PASSTHROUGH`): Windows' PostScript driver (PScript5) and drivers built on it do.
+pub fn postscript_passthrough(printer: &str, settings: Option<&DevMode>) -> Result<bool> {
+    #[cfg(windows)]
+    {
+        windows::postscript_passthrough(printer, settings)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (printer, settings);
+        Err(PrintError::Unsupported)
+    }
+}
+
+/// Prints each sheet's EPS, one page per sheet, through a PostScript driver: the document's
+/// colours (CMYK, spot colours, overprint) reach the printer as they are, where a GDI or XPS
+/// page would be RGB. `progress` hears each sheet once the driver has taken it.
+pub fn print_postscript(
+    job: &PostScriptJob<'_>,
+    sheets: &[PostScriptSheet<'_>],
+    progress: &mut dyn FnMut(usize),
+) -> Result<()> {
+    if sheets.is_empty() {
+        return Err(PrintError::Invalid("nothing to print".into()));
+    }
+    let finite = |v: &[f64]| v.iter().all(|v| v.is_finite());
+    if sheets.iter().any(|s| {
+        s.eps.is_empty()
+            || !finite(&[s.size.0, s.size.1, s.rect.0, s.rect.1, s.rect.2, s.rect.3])
+            || !(s.size.0 > 0.0 && s.size.1 > 0.0 && s.rect.2 > 0.0 && s.rect.3 > 0.0)
+    }) {
+        return Err(PrintError::Invalid(
+            "a sheet is empty or has no size".into(),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        windows::print_postscript(job, sheets, progress)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (job, progress);
+        Err(PrintError::Unsupported)
+    }
+}
+
+/// The PostScript before and after a sheet's EPS. The driver's user space at that point is
+/// GDI's (device pixels from the printable corner, y down); the sheet goes to its box, y up, in
+/// points, clipped to its edges. It runs on a dictionary stack of only the permanent
+/// dictionaries — the driver's own (Pscript_WinNT_Compat's short names among them) are set aside
+/// and put back after, since EPS procedures look some of the same names up — inside save and
+/// restore, with whatever it leaves on the operand stack removed.
+pub(crate) fn postscript_wrapper(page: &Page, sheet: &PostScriptSheet<'_>) -> (String, String) {
+    let (dx, dy) = (f64::from(page.dpi.0) / 72.0, f64::from(page.dpi.1) / 72.0);
+    let (x, y, w, h) = sheet.rect;
+    let left = (x - page.printable.0) * dx;
+    let bottom = (y + h - page.printable.1) * dy;
+    let (sx, sy) = (w / sheet.size.0 * dx, -h / sheet.size.1 * dy);
+    let (sw, sh) = sheet.size;
+    let head = format!(
+        "\nuserdict /CraftSheet save put count userdict /CraftOps 3 -1 roll put\n\
+         userdict /CraftBase /globaldict where {{pop 3}} {{2}} ifelse put userdict /CraftStack countdictstack array dictstack put\n\
+         countdictstack CraftBase sub {{end}} repeat userdict begin /showpage {{}} def\n\
+         0 setgray 0 setlinecap 1 setlinewidth 0 setlinejoin 10 setmiterlimit [] 0 setdash newpath\n\
+         {left:.3} {bottom:.3} translate {sx:.6} {sy:.6} scale\n\
+         0 0 moveto {sw:.3} 0 lineto {sw:.3} {sh:.3} lineto 0 {sh:.3} lineto closepath clip newpath\n\
+         %%BeginDocument: sheet.eps\n"
+    );
+    let tail = "\n%%EndDocument\ncount CraftOps sub {pop} repeat countdictstack CraftBase sub {end} repeat\n\
+                CraftStack CraftBase 1 index length CraftBase sub getinterval {begin} forall CraftSheet restore\n"
+        .to_string();
+    (head, tail)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -414,6 +513,94 @@ mod tests {
             !DevMode::from_bytes(ignored).unwrap().has_manual_copies(),
             "active driver fields must retain our copy policy"
         );
+    }
+
+    #[test]
+    fn a_postscript_sheet_lands_in_its_box_in_device_pixels() {
+        // A5 centred on A4 at 600 dpi, 12 pt hard margins: the EPS's origin goes to the box's
+        // lower-left corner in device pixels from the printable corner, y flipped.
+        let page = Page {
+            paper: (595.0, 842.0),
+            printable: (12.0, 12.0, 571.0, 818.0),
+            dpi: (600, 600),
+        };
+        let sheet = PostScriptSheet {
+            eps: b"%!PS-Adobe-3.0 EPSF-3.0",
+            size: (420.0, 595.0),
+            rect: (87.5, 123.5, 420.0, 595.0),
+        };
+        let (head, tail) = postscript_wrapper(&page, &sheet);
+        assert!(
+            head.contains("629.167 5887.500 translate 8.333333 -8.333333 scale"),
+            "{head}"
+        );
+        assert!(
+            head.contains(
+                "0 0 moveto 420.000 0 lineto 420.000 595.000 lineto 0 595.000 lineto closepath clip"
+            ),
+            "{head}"
+        );
+        assert!(
+            head.contains(
+                "countdictstack CraftBase sub {end} repeat userdict begin /showpage {} def"
+            ),
+            "{head}"
+        );
+        assert!(head.ends_with("%%BeginDocument: sheet.eps\n"));
+        assert!(
+            tail.ends_with("getinterval {begin} forall CraftSheet restore\n"),
+            "{tail}"
+        );
+        // Half size: the scale halves, the corner stays.
+        let half = PostScriptSheet {
+            rect: (87.5, 123.5, 210.0, 297.5),
+            ..sheet
+        };
+        assert!(
+            postscript_wrapper(&page, &half)
+                .0
+                .contains("629.167 3408.333 translate 4.166667 -4.166667 scale")
+        );
+    }
+
+    #[test]
+    fn print_postscript_rejects_empty_sheets_before_any_system_call() {
+        let job = PostScriptJob {
+            printer: "nobody",
+            settings: None,
+            title: "t",
+            output_file: None,
+        };
+        let sheet = PostScriptSheet {
+            eps: b"%!",
+            size: (100.0, 100.0),
+            rect: (0.0, 0.0, 100.0, 100.0),
+        };
+        let mut heard = |_| {};
+        for bad in [
+            PostScriptSheet { eps: b"", ..sheet },
+            PostScriptSheet {
+                size: (0.0, 100.0),
+                ..sheet
+            },
+            PostScriptSheet {
+                rect: (0.0, f64::NAN, 100.0, 100.0),
+                ..sheet
+            },
+            PostScriptSheet {
+                rect: (0.0, 0.0, -1.0, 100.0),
+                ..sheet
+            },
+        ] {
+            assert!(matches!(
+                print_postscript(&job, &[bad], &mut heard),
+                Err(PrintError::Invalid(_))
+            ));
+        }
+        assert!(matches!(
+            print_postscript(&job, &[], &mut heard),
+            Err(PrintError::Invalid(_))
+        ));
     }
 
     #[test]
