@@ -108,6 +108,20 @@ impl PrintCapabilities {
         Ok(PrintCapabilities { document })
     }
 
+    /// Fetch and parse print capabilities for the given printer device in the context of a print
+    /// ticket, such as [`PrintTicket::user_default`]: a driver whose capabilities depend on its
+    /// settings (a label driver's one "User defined" stock) answers for that ticket's settings
+    /// rather than for the printer's defaults.
+    pub fn fetch_for_ticket(
+        device: &PrinterDevice,
+        ticket: &PrintTicket,
+    ) -> Result<PrintCapabilities, FetchPrintCapabilitiesError> {
+        let xml = Self::fetch_xml_for_ticket(device, Some(ticket))?;
+        let document = PrintCapabilitiesDocument::parse_from_bytes(xml)
+            .map_err(FetchPrintCapabilitiesError::ParseError)?;
+        Ok(PrintCapabilities { document })
+    }
+
     /// Defines all parameters with default values.
     pub fn default_parameters(&self) -> impl Iterator<Item = ParameterInit> + '_ {
         self.document.parameter_defs.iter().filter_map(|param_def| {
