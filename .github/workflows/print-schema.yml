@@ -1,0 +1,13 @@
+name: Print Schema regression tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  parser:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: 'cargo test --no-default-features --lib ticket::document::'
