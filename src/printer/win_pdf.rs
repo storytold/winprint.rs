@@ -3,11 +3,11 @@ use super::DxgiPrintContextError;
 use crate::printer::FilePrinter;
 use crate::printer::PrinterDevice;
 use crate::ticket::PrintTicket;
+use std::io::Read as _;
 use std::path::Path;
 use thiserror::Error;
-use windows::core::HSTRING;
 use windows::Data::Pdf::PdfDocument;
-use windows::Storage::StorageFile;
+use windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
 use windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_F;
 use windows::Win32::System::WinRT::Pdf::PdfCreateRenderer;
 use windows::Win32::System::WinRT::Pdf::PDF_RENDER_PARAMS;
@@ -70,16 +70,7 @@ impl WinPdfPrinter {
         let print_control = &context.print_control;
         let d2d_context = &context.d2d_context;
         unsafe {
-            let absolute_path =
-                std::path::absolute(path).map_err(WinPdfPrinterError::InvalidPath)?;
-            let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(absolute_path.as_path()))
-                .map_err(WinPdfPrinterError::FailedToOpenDocument)?
-                .join()
-                .map_err(WinPdfPrinterError::FailedToOpenDocument)?;
-            let pdf_document = PdfDocument::LoadFromFileAsync(&file)
-                .map_err(WinPdfPrinterError::FailedToOpenDocument)?
-                .join()
-                .map_err(WinPdfPrinterError::FailedToOpenDocument)?;
+            let pdf_document = load_document(path)?;
 
             let pdf_renderer =
                 PdfCreateRenderer(dxgi_device).map_err(WinPdfPrinterError::RenderError)?;
@@ -127,8 +118,68 @@ impl WinPdfPrinter {
     }
 }
 
+// StorageFile path resolution can refuse otherwise readable desktop files (for example
+// hidden temporary job files). Read with desktop file access and give Windows.Data.Pdf
+// a stream instead. Transfer in chunks to avoid a second whole-file byte allocation.
+fn load_document(path: &Path) -> Result<PdfDocument, WinPdfPrinterError> {
+    let mut file = std::fs::File::open(path).map_err(WinPdfPrinterError::InvalidPath)?;
+    let stream =
+        InMemoryRandomAccessStream::new().map_err(WinPdfPrinterError::FailedToOpenDocument)?;
+    let writer =
+        DataWriter::CreateDataWriter(&stream).map_err(WinPdfPrinterError::FailedToOpenDocument)?;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(WinPdfPrinterError::InvalidPath)?;
+        if count == 0 {
+            break;
+        }
+        // Read guarantees count is within the supplied buffer.
+        writer
+            .WriteBytes(&buffer[..count])
+            .map_err(WinPdfPrinterError::FailedToOpenDocument)?;
+        writer
+            .StoreAsync()
+            .map_err(WinPdfPrinterError::FailedToOpenDocument)?
+            .join()
+            .map_err(WinPdfPrinterError::FailedToOpenDocument)?;
+    }
+    writer
+        .DetachStream()
+        .map_err(WinPdfPrinterError::FailedToOpenDocument)?;
+    stream
+        .Seek(0)
+        .map_err(WinPdfPrinterError::FailedToOpenDocument)?;
+    PdfDocument::LoadFromStreamAsync(&stream)
+        .map_err(WinPdfPrinterError::FailedToOpenDocument)?
+        .join()
+        .map_err(WinPdfPrinterError::FailedToOpenDocument)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn loads_a_hidden_job_file_without_storage_broker_path_access() {
+        use std::io::Write;
+        use std::os::windows::fs::OpenOptionsExt;
+        let _com = crate::utils::com::ComInitializer::new();
+        let path =
+            std::env::temp_dir().join(format!("winprint-hidden-{}.pdf", uuid::Uuid::new_v4()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .attributes(2)
+            .open(&path)
+            .unwrap(); // FILE_ATTRIBUTE_HIDDEN
+        file.write_all(include_bytes!("../../test_data/test_document.pdf"))
+            .unwrap();
+        drop(file);
+        let result = super::load_document(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert!(result.unwrap().PageCount().unwrap() > 0);
+    }
+
     use super::WinPdfPrinter;
     use crate::{printer::FilePrinter, test_utils::null_device};
     use std::path::Path;
