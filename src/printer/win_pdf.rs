@@ -124,14 +124,9 @@ impl WinPdfPrinter {
 // read-only, file-backed WinRT stream directly: no whole-file copy and no per-chunk
 // DataWriter/StoreAsync operations. The PDF renderer reads the file on demand.
 fn open_document_stream(path: &Path) -> Result<IRandomAccessStream, WinPdfPrinterError> {
+    // On Windows, absolute also rejects embedded NULs before any native stream call.
     let absolute_path = std::path::absolute(path).map_err(WinPdfPrinterError::InvalidPath)?;
     let file_path = HSTRING::from(absolute_path.as_path());
-    if file_path.contains(&0) {
-        return Err(WinPdfPrinterError::InvalidPath(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "the PDF path contains a NUL character",
-        )));
-    }
     // SAFETY: HSTRING owns a NUL-terminated path for the duration of the call.
     // The windows binding supplies IRandomAccessStream's IID and owns the returned
     // COM reference. Read access does not create or modify the input file.
@@ -156,18 +151,31 @@ mod tests {
         let _com = crate::utils::com::ComInitializer::new();
         let path =
             std::env::temp_dir().join(format!("winprint-hidden-{}.pdf", uuid::Uuid::new_v4()));
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .attributes(2)
             .open(&path)
             .unwrap(); // FILE_ATTRIBUTE_HIDDEN
-        file.write_all(include_bytes!("../../test_data/test_document.pdf"))
-            .unwrap();
-        drop(file);
-        let result = super::load_document(&path);
-        std::fs::remove_file(&path).unwrap();
-        assert!(result.unwrap().PageCount().unwrap() > 0);
+        let path = scopeguard::guard(path, |path| {
+            let _ = std::fs::remove_file(path);
+        });
+        // Handles created below the guard are released before its cleanup on a panic.
+        {
+            let mut output = file;
+            output
+                .write_all(include_bytes!("../../test_data/test_document.pdf"))
+                .unwrap();
+        }
+        {
+            let document = super::load_document(&path).unwrap();
+            assert!(document.PageCount().unwrap() > 0);
+            let page = document.GetPage(0).unwrap();
+            let size = page.Size().unwrap();
+            assert!(size.Width > 0.0 && size.Height > 0.0);
+        }
+        // Verify normal cleanup only after the page and document have been released.
+        std::fs::remove_file(&*path).unwrap();
     }
 
     #[test]
@@ -181,9 +189,14 @@ mod tests {
             .create_new(true)
             .open(&path)
             .unwrap();
+        let path = scopeguard::guard(path, |path| {
+            let _ = std::fs::remove_file(path);
+        });
         let size = 256 * 1024 * 1024;
-        file.set_len(size).unwrap();
-        drop(file);
+        {
+            let output = file;
+            output.set_len(size).unwrap();
+        }
         {
             let stream = super::open_document_stream(&path).unwrap();
             assert_eq!(stream.Size().unwrap(), size);
@@ -197,7 +210,7 @@ mod tests {
             assert_eq!(reader.LoadAsync(1).unwrap().join().unwrap(), 1);
             assert_eq!(reader.ReadByte().unwrap(), 0);
         }
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&*path).unwrap();
     }
 
     #[test]
@@ -210,12 +223,13 @@ mod tests {
     }
 
     #[test]
-    fn a_path_with_an_embedded_nul_is_rejected() {
+    fn windows_path_normalization_rejects_embedded_nul() {
         let _com = crate::utils::com::ComInitializer::new();
         let path = std::path::Path::new("job.pdf\0ignored");
         assert!(matches!(
             super::open_document_stream(path),
-            Err(super::WinPdfPrinterError::InvalidPath(_))
+            Err(super::WinPdfPrinterError::InvalidPath(error))
+                if error.kind() == std::io::ErrorKind::InvalidInput
         ));
     }
 
