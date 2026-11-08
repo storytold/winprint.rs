@@ -180,7 +180,9 @@ mod tests {
 
     #[test]
     fn file_stream_reads_the_end_of_a_large_file_on_demand() {
-        use windows::Storage::Streams::{DataReader, InputStreamOptions};
+        use std::io::{Seek, SeekFrom, Write};
+        use std::time::{Duration, Instant};
+        use windows::Storage::Streams::{Buffer, DataReader, InputStreamOptions};
         let _com = crate::utils::com::ComInitializer::new();
         let path =
             std::env::temp_dir().join(format!("winprint-large-{}.bin", uuid::Uuid::new_v4()));
@@ -194,8 +196,11 @@ mod tests {
         });
         let size = 256 * 1024 * 1024;
         {
-            let output = file;
+            let mut output = file;
             output.set_len(size).unwrap();
+            output.seek(SeekFrom::End(-1)).unwrap();
+            output.write_all(&[0xa5]).unwrap();
+            output.sync_all().unwrap();
         }
         {
             let stream = super::open_document_stream(&path).unwrap();
@@ -203,12 +208,24 @@ mod tests {
             assert!(stream.CanRead().unwrap());
             assert!(!stream.CanWrite().unwrap());
             let input = stream.GetInputStreamAt(size - 1).unwrap();
-            let reader = DataReader::CreateDataReader(&input).unwrap();
-            reader
-                .SetInputStreamOptions(InputStreamOptions::Partial)
+            let buffer = Buffer::Create(1).unwrap();
+            let read = input
+                .ReadAsync(&buffer, 1, InputStreamOptions::None)
                 .unwrap();
-            assert_eq!(reader.LoadAsync(1).unwrap().join().unwrap(), 1);
-            assert_eq!(reader.ReadByte().unwrap(), 0);
+            let started = Instant::now();
+            // AsyncStatus::Started is 0. Poll the native operation rather than waiting
+            // indefinitely for a completion callback: this test previously hung in CI.
+            while read.Status().unwrap().0 == 0 {
+                if started.elapsed() >= Duration::from_secs(30) {
+                    let _ = read.Cancel();
+                    panic!("the one-byte file-backed read did not complete within 30 seconds");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let bytes = read.GetResults().unwrap();
+            assert_eq!(bytes.Length().unwrap(), 1);
+            let reader = DataReader::FromBuffer(&bytes).unwrap();
+            assert_eq!(reader.ReadByte().unwrap(), 0xa5);
         }
         std::fs::remove_file(&*path).unwrap();
     }
