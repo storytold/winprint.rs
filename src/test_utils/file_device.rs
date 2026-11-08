@@ -314,6 +314,18 @@ mod tests {
             .any(|p| p.name() == name)
     }
 
+    fn assert_port_removed(path: &Path) {
+        let script = format!(
+            r#"
+$ErrorActionPreference = 'Stop'
+$ports = @(Get-PrinterPort -ErrorAction Stop | Where-Object {{ $_.Name -ceq {port_q} }})
+if ($ports.Count -ne 0) {{ throw 'printer port still present after drop' }}
+"#,
+            port_q = ps_quote(&path.to_string_lossy()),
+        );
+        run_powershell("verify port removal", &script).unwrap();
+    }
+
     #[test]
     fn cleanup_removes_file_ports_by_their_quoted_name() {
         // Shadow the print cmdlets: this exercises the real generated script and its
@@ -372,20 +384,24 @@ function Remove-PrinterPort {
             "backing file {} still present after drop",
             path.display()
         );
+        assert_port_removed(&path);
     }
 
     #[test]
     fn pdf_device_lifetime() {
         let name;
+        let path;
         {
             let dev = FilePrinterDevice::<Pdf>::new().unwrap();
             name = dev.device().name().to_string();
+            path = dev.file_path().to_path_buf();
             assert!(printer_exists(&name), "printer {name} was not created");
         }
         assert!(
             !printer_exists(&name),
             "printer {name} still present after drop"
         );
+        assert_port_removed(&path);
     }
 
     #[test]
