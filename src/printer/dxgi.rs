@@ -30,6 +30,8 @@ use windows::Win32::Graphics::Direct3D11::D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 use windows::Win32::Graphics::Direct3D11::D3D11_SDK_VERSION;
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Graphics::Gdi::DEVMODEW;
+use windows::Win32::Graphics::Gdi::DM_PRINTQUALITY;
+use windows::Win32::Graphics::Gdi::DM_YRESOLUTION;
 use windows::Win32::Graphics::Imaging::CLSID_WICImagingFactory2;
 use windows::Win32::Graphics::Imaging::D2D::IWICImagingFactory2;
 use windows::Win32::Storage::Xps::Printing::IPrintDocumentPackageStatusEvent;
@@ -67,7 +69,23 @@ pub enum DxgiPrintContextError {
     FailedToClosePrintControl(#[source] windows::core::Error),
 }
 
-const DEFAULT_DPI: i16 = 300;
+const DEFAULT_DPI: u32 = 300;
+
+/// The resolution that `dev_mode` asks for, taking one axis for the other when it asks for only
+/// one, or [`DEFAULT_DPI`] when it asks for none. `dmPrintQuality` can hold a negative `DMRES_*`
+/// quality level instead of a resolution; that is not a resolution and is ignored.
+fn resolution(dev_mode: &DEVMODEW) -> (u32, u32) {
+    let print_quality = unsafe { dev_mode.Anonymous1.Anonymous1.dmPrintQuality };
+    let axis = |flag, dpi: i16| (dev_mode.dmFields.contains(flag) && dpi > 0).then_some(dpi as u32);
+    match (
+        axis(DM_PRINTQUALITY, print_quality),
+        axis(DM_YRESOLUTION, dev_mode.dmYResolution),
+    ) {
+        (Some(x), Some(y)) => (x, y),
+        (Some(dpi), None) | (None, Some(dpi)) => (dpi, dpi),
+        (None, None) => (DEFAULT_DPI, DEFAULT_DPI),
+    }
+}
 
 /// Represents a print context during printing via DXGI.
 #[allow(missing_docs)]
@@ -83,6 +101,8 @@ pub struct DxgiPrintContext {
     pub document_target: IPrintDocumentPackageTarget,
     pub print_control: ID2D1PrintControl,
     pub completion_waiter: PrintCompletionWaiter,
+    /// The resolution the job's ticket asks for, in dots per inch (x, y).
+    pub dpi: (u32, u32),
     status_connection: IConnectionPoint,
     status_cookie: u32,
     completed: bool,
@@ -103,29 +123,7 @@ impl DxgiPrintContext {
             let dev_mode = options
                 .to_dev_mode(device)
                 .map_err(DxgiPrintContextError::PrintTicketError)?;
-            let raster_dpi = {
-                let dev_mode = &*(dev_mode.as_ptr() as *const DEVMODEW);
-                let dpi_x = if (dev_mode.dmFields & windows::Win32::Graphics::Gdi::DM_PRINTQUALITY)
-                    .0
-                    != 0
-                {
-                    Some(dev_mode.Anonymous1.Anonymous1.dmPrintQuality)
-                } else {
-                    None
-                };
-                let dpi_y =
-                    if (dev_mode.dmFields & windows::Win32::Graphics::Gdi::DM_YRESOLUTION).0 != 0 {
-                        Some(dev_mode.dmYResolution)
-                    } else {
-                        None
-                    };
-                match (dpi_x, dpi_y) {
-                    (Some(x), Some(y)) => max(x, y),
-                    (Some(x), None) => x,
-                    (None, Some(y)) => y,
-                    (None, None) => DEFAULT_DPI,
-                }
-            };
+            let dpi = resolution(&*(dev_mode.as_ptr() as *const DEVMODEW));
             let mut d3d_device: Option<ID3D11Device> = None;
             let mut d3d_context: Option<ID3D11DeviceContext> = None;
             D3D11CreateDevice(
@@ -166,6 +164,7 @@ impl DxgiPrintContext {
             let d2d_context = d2d_device
                 .CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)
                 .map_err(DxgiPrintContextError::InitializeDirectX)?;
+            d2d_context.SetDpi(dpi.0 as f32, dpi.1 as f32);
 
             let wic_factory: IWICImagingFactory2 =
                 CoCreateInstance(&CLSID_WICImagingFactory2, None, CLSCTX_ALL)
@@ -185,7 +184,7 @@ impl DxgiPrintContext {
                 )
                 .map_err(DxgiPrintContextError::FailedToStartJob)?;
             let print_control_options = D2D1_PRINT_CONTROL_PROPERTIES {
-                rasterDPI: raster_dpi as f32,
+                rasterDPI: max(dpi.0, dpi.1) as f32,
                 ..Default::default()
             };
             let print_control = d2d_device
@@ -222,6 +221,7 @@ impl DxgiPrintContext {
                 document_target,
                 print_control,
                 completion_waiter,
+                dpi,
                 status_connection,
                 status_cookie,
                 completed: false,
@@ -257,5 +257,44 @@ impl Drop for DxgiPrintContext {
             // Release the event sink while the COM apartment is still initialized.
             let _ = self.status_connection.Unadvise(self.status_cookie);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolution, DEFAULT_DPI};
+    use windows::Win32::Graphics::Gdi::{DEVMODEW, DMRES_HIGH, DM_PRINTQUALITY, DM_YRESOLUTION};
+
+    fn dev_mode(quality: Option<i16>, y: Option<i16>) -> DEVMODEW {
+        let mut dev_mode = DEVMODEW::default();
+        if let Some(quality) = quality {
+            dev_mode.dmFields |= DM_PRINTQUALITY;
+            dev_mode.Anonymous1.Anonymous1.dmPrintQuality = quality;
+        }
+        if let Some(y) = y {
+            dev_mode.dmFields |= DM_YRESOLUTION;
+            dev_mode.dmYResolution = y;
+        }
+        dev_mode
+    }
+
+    #[test]
+    fn the_resolution_comes_from_the_dev_mode_and_never_from_a_quality_level() {
+        assert_eq!(resolution(&dev_mode(Some(600), Some(1200))), (600, 1200));
+        assert_eq!(resolution(&dev_mode(Some(300), None)), (300, 300));
+        assert_eq!(resolution(&dev_mode(None, Some(360))), (360, 360));
+        // `DMRES_HIGH` (-4) is a quality level, not a resolution.
+        assert_eq!(
+            resolution(&dev_mode(Some(DMRES_HIGH as i16), Some(600))),
+            (600, 600)
+        );
+        assert_eq!(
+            resolution(&dev_mode(Some(DMRES_HIGH as i16), None)),
+            (DEFAULT_DPI, DEFAULT_DPI)
+        );
+        assert_eq!(
+            resolution(&dev_mode(None, None)),
+            (DEFAULT_DPI, DEFAULT_DPI)
+        );
     }
 }
