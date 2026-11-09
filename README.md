@@ -74,6 +74,11 @@ The narrow changes used by craft-print are:
   An unsuccessful job requests cancellation; the status connection is unadvised
   before its COM apartment is released. The timeout does not bound calls into a
   printer driver or an interactive output-file dialog.
+- PDF loading uses a read-only file-backed stream, but `LoadFromStreamAsync` is
+  currently joined without a deadline. The completion timeout above does not bound
+  document loading. Adding cancellation requires keeping the stream and temporary
+  file alive until the native operation has actually stopped; returning from a
+  timeout alone is not sufficient. This remains a known limitation of the loader.
 - `WinPdfPrinter::print_with_progress(path, ticket, callback)` reports `(processed,
   total)` after each successful Direct2D AddPage, preserving one job and its ticket.
   These counts measure page processing, never physical printing or terminal success.
