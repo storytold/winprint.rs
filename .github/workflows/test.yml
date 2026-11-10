@@ -1,12 +1,20 @@
 name: Test
 
 on:
+  # Pull requests are tested by the pull_request event; pushing to every branch as well ran the
+  # same Windows feature matrix twice for each branch in this repository.
   push:
-    branches:
-      - "**"
+    branches: [main]
   pull_request:
-    branches:
-      - "**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  # A newer push to a pull request replaces its older run; runs on main always finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,12 +23,15 @@ jobs:
   test:
     runs-on: windows-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Setup Rust toolchain
       uses: moonrepo/setup-rust@v1
       with:
         channel: stable
         bins: cargo-hack
+        # Save the dependency cache from main only; pull requests restore it. Each pull request
+        # used to save its own 0.5-1 GB copy that no other branch can restore.
+        cache-base: main
       env:
         GITHUB_TOKEN: ${{ github.token }}
     - name: Test
