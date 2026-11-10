@@ -21,6 +21,7 @@ thiserror = "2.0"
 fmt-derive = "0.1"
 xml = "1.2"
 windows-core = "0.62"
+windows-numerics = "0.3"
 windows-implement = "0.60.2"
 
 [dependencies.windows]
