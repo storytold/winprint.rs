@@ -174,7 +174,9 @@ foreach ($p in $printers) {{
     catch {{ Write-Warning ("Remove-Printer {{0}} failed: {{1}}" -f $p.Name, $_.Exception.Message) }}
 
     if ($port = Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue) {{
-        try {{ Remove-PrinterPort -InputObject $port }}
+        # File-port names contain path separators; explicitly select the local server
+        # so the provider does not interpret the port name as a server/printer name.
+        try {{ Remove-PrinterPort -Name $portName -ComputerName $env:COMPUTERNAME }}
         catch {{ Write-Warning ("Remove-PrinterPort {{0}} failed: {{1}}" -f $portName, $_.Exception.Message) }}
     }}
     if (Test-Path -LiteralPath $portName) {{
@@ -273,11 +275,9 @@ Add-Printer -Name {name_q} -PortName {port_q} -DriverName {driver_q}
     }
 }
 
-impl<T: FilePrinterProvider> Drop for FilePrinterDevice<T> {
-    fn drop(&mut self) {
-        let port_str = self.port_path.to_string_lossy().into_owned();
-        let script = format!(
-            r#"
+fn printer_cleanup_script(printer_name: &str, port_name: &str) -> String {
+    format!(
+        r#"
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
 if ($p = Get-Printer -Name {name_q} -ErrorAction SilentlyContinue) {{
@@ -285,13 +285,20 @@ if ($p = Get-Printer -Name {name_q} -ErrorAction SilentlyContinue) {{
     catch {{ Write-Warning ("Remove-Printer {{0}} failed: {{1}}" -f {name_q}, $_.Exception.Message) }}
 }}
 if ($port = Get-PrinterPort -Name {port_q} -ErrorAction SilentlyContinue) {{
-    try {{ Remove-PrinterPort -InputObject $port }}
+    # Explicit local server avoids provider name validation on file-port paths.
+    try {{ Remove-PrinterPort -Name {port_q} -ComputerName $env:COMPUTERNAME }}
     catch {{ Write-Warning ("Remove-PrinterPort failed: {{0}}" -f $_.Exception.Message) }}
 }}
 "#,
-            name_q = ps_quote(self.device.name()),
-            port_q = ps_quote(&port_str),
-        );
+        name_q = ps_quote(printer_name),
+        port_q = ps_quote(port_name),
+    )
+}
+
+impl<T: FilePrinterProvider> Drop for FilePrinterDevice<T> {
+    fn drop(&mut self) {
+        let port_str = self.port_path.to_string_lossy().into_owned();
+        let script = printer_cleanup_script(self.device.name(), &port_str);
         // Drop cannot propagate errors.
         let _ = run_powershell("remove printer", &script);
         let _ = std::fs::remove_file(&self.port_path);
@@ -308,6 +315,62 @@ mod tests {
             .unwrap()
             .into_iter()
             .any(|p| p.name() == name)
+    }
+
+    fn assert_port_removed(path: &Path) {
+        let script = format!(
+            r#"
+$ErrorActionPreference = 'Stop'
+$ports = @(Get-PrinterPort -ErrorAction Stop | Where-Object {{ $_.Name -ceq {port_q} }})
+if ($ports.Count -ne 0) {{ throw 'printer port still present after drop' }}
+"#,
+            port_q = ps_quote(&path.to_string_lossy()),
+        );
+        run_powershell("verify port removal", &script).unwrap();
+    }
+
+    #[test]
+    fn cleanup_removes_file_ports_on_the_explicit_local_server() {
+        // Shadow the print cmdlets: this exercises the real generated script and its
+        // parameter binding without installing/deleting a system printer or port.
+        for port in [
+            r"C:\Temp\test.prn",
+            r"C:\Temp\it's a [test], file.prn",
+            r"\\?\C:\Temp\test.prn",
+        ] {
+            let setup = format!(
+                "$script:expectedPort = {}; $script:portRemoved = $false;",
+                ps_quote(port)
+            );
+            let stubs = r#"
+function Get-Printer {
+    [CmdletBinding()] param([string]$Name)
+    return $null
+}
+function Get-PrinterPort {
+    [CmdletBinding()] param([string]$Name)
+    if ($Name -cne $script:expectedPort) { throw 'incorrect port lookup' }
+    return [pscustomobject]@{ Name = $Name }
+}
+function Remove-PrinterPort {
+    [CmdletBinding(DefaultParameterSetName='Name')]
+    param(
+        [Parameter(ParameterSetName='Name', Mandatory=$true)][string]$Name,
+        [Parameter(ParameterSetName='Object', Mandatory=$true)][object]$InputObject,
+        [string]$ComputerName
+    )
+    if ($PSCmdlet.ParameterSetName -ne 'Name') { throw 'object binding rejected for file port' }
+    if ($Name -cne $script:expectedPort) { throw 'incorrect port removal' }
+    if ($ComputerName -cne $env:COMPUTERNAME) { throw 'file-port removal requires explicit local server' }
+    $script:portRemoved = $true
+}
+"#;
+            let script = format!(
+                "{setup}\n{stubs}\n{}\nif (-not $script:portRemoved) {{ throw 'port was not removed' }}",
+                printer_cleanup_script("test fixture", port)
+            );
+            run_powershell("quoted-name cleanup regression", &script).unwrap();
+        }
     }
 
     #[test]
@@ -330,20 +393,24 @@ mod tests {
             "backing file {} still present after drop",
             path.display()
         );
+        assert_port_removed(&path);
     }
 
     #[test]
     fn pdf_device_lifetime() {
         let name;
+        let path;
         {
             let dev = FilePrinterDevice::<Pdf>::new().unwrap();
             name = dev.device().name().to_string();
+            path = dev.file_path().to_path_buf();
             assert!(printer_exists(&name), "printer {name} was not created");
         }
         assert!(
             !printer_exists(&name),
             "printer {name} still present after drop"
         );
+        assert_port_removed(&path);
     }
 
     #[test]
