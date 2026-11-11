@@ -152,11 +152,9 @@ impl DxgiPrintContext {
             // Windows.Data.Pdf renders a page on several worker threads that share this
             // device context. A single-threaded factory has no locking, so they race inside
             // d2d1.dll (access violations reading near null or calling freed memory).
-            let d2d_factory: ID2D1Factory1 = D2D1CreateFactory(
-                D2D1_FACTORY_TYPE_MULTI_THREADED,
-                Some(&d2d_factory_options),
-            )
-            .map_err(DxgiPrintContextError::InitializeDirectX)?;
+            let d2d_factory: ID2D1Factory1 =
+                D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, Some(&d2d_factory_options))
+                    .map_err(DxgiPrintContextError::InitializeDirectX)?;
 
             let d2d_device = d2d_factory
                 .CreateDevice(&dxgi_device)
