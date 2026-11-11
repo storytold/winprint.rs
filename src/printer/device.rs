@@ -24,6 +24,21 @@ pub enum EnumDeviceError {
     FailedToEnumPrinterDevice(#[source] windows::core::Error),
 }
 
+#[derive(Error, Debug)]
+/// Represents an error occurred while reading a printer's driver information.
+pub enum DriverInfoError {
+    /// Failed to open the printer.
+    #[error("Failed to open the printer")]
+    FailedToOpenPrinter(#[source] windows::core::Error),
+    /// Failed to read the printer's driver information.
+    #[error("Failed to read the printer's driver information")]
+    FailedToGetPrinterDriver(#[source] windows::core::Error),
+}
+
+/// The most bytes [`PrinterDevice::is_xps_driver`] reads a `DRIVER_INFO_8` into: far more than
+/// any driver's strings take.
+const MAX_DRIVER_INFO_BYTES: u32 = 1 << 20;
+
 impl PrinterDevice {
     /// Fetch all printer devices.
     pub fn all() -> Result<Vec<Self>, EnumDeviceError> {
@@ -134,6 +149,53 @@ impl PrinterDevice {
     pub fn is_remote(&self) -> bool {
         self.os_attributes & PRINTER_ATTRIBUTE_NETWORK != 0
     }
+
+    /// Whether the printer's driver renders XPS itself: `PRINTER_DRIVER_XPS` in its
+    /// `DRIVER_INFO_8`, set for v4 drivers and for v3 drivers with an XPS rendering filter. Other
+    /// drivers are GDI drivers, which the XPS print API reaches through Windows' XPS-to-GDI
+    /// conversion; a page with transparency can come out wrong there or fail to print.
+    pub fn is_xps_driver(&self) -> Result<bool, DriverInfoError> {
+        let printer_name = wchar::to_wide_chars(self.os_name());
+        unsafe {
+            let mut handle = PRINTER_HANDLE::default();
+            OpenPrinterW(
+                PCWSTR(printer_name.as_ptr()),
+                ptr::addr_of_mut!(handle),
+                None,
+            )
+            .map_err(DriverInfoError::FailedToOpenPrinter)?;
+            scopeguard::defer! {
+                let _ = ClosePrinter(handle);
+            }
+            let mut needed: u32 = 0;
+            // The first call only says how large the information is.
+            let _ = GetPrinterDriverW(handle, PCWSTR::null(), 8, None, ptr::addr_of_mut!(needed));
+            if needed < mem::size_of::<DRIVER_INFO_8W>() as u32 || needed > MAX_DRIVER_INFO_BYTES {
+                return Err(DriverInfoError::FailedToGetPrinterDriver(
+                    windows::core::Error::from_thread(),
+                ));
+            }
+            // u64 words, so the structure at the start of the buffer is aligned.
+            let mut words = vec![0u64; (needed as usize).div_ceil(8)];
+            let bytes =
+                std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), words.len() * 8);
+            if !GetPrinterDriverW(
+                handle,
+                PCWSTR::null(),
+                8,
+                Some(bytes),
+                ptr::addr_of_mut!(needed),
+            )
+            .as_bool()
+            {
+                return Err(DriverInfoError::FailedToGetPrinterDriver(
+                    windows::core::Error::from_thread(),
+                ));
+            }
+            let info = &*(words.as_ptr().cast::<DRIVER_INFO_8W>());
+            Ok(info.dwPrinterDriverAttributes & PRINTER_DRIVER_XPS != 0)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -144,6 +206,14 @@ mod tests {
     #[test]
     fn fetch_printer_device() {
         let _devices = PrinterDevice::all().unwrap();
+    }
+
+    /// The test queues use the Microsoft XPS Document Writer or the Generic / Text Only driver;
+    /// either way the driver's information can be read.
+    #[test]
+    fn a_printer_says_whether_its_driver_renders_xps() {
+        let device = null_device::thread_local();
+        device.is_xps_driver().unwrap();
     }
 
     #[test]
