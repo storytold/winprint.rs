@@ -209,11 +209,11 @@ impl PrintTicket {
 /// two version words.
 const DM_SIZE_AT: usize = 68;
 const DM_DRIVER_EXTRA_AT: usize = 70;
-/// The smallest DEVMODEW a driver writes (up to `dmICMIntent`).
-const DM_MIN_SIZE: usize = 156;
+/// The smallest public part of a DEVMODEW: the members up to `dmFields`.
+const DM_MIN_SIZE: usize = 76;
 
 /// The size of the DEVMODE at the start of `bytes` (`dmSize + dmDriverExtra`); `None` when its
-/// public part is shorter than the smallest DEVMODEW or `bytes` doesn't hold all of it.
+/// public part ends before `dmFields` does or `bytes` doesn't hold all of it.
 fn dev_mode_size(bytes: &[u8]) -> Option<usize> {
     let word = |at: usize| {
         bytes
@@ -228,8 +228,8 @@ fn dev_mode_size(bytes: &[u8]) -> Option<usize> {
 #[derive(Error, Debug)]
 /// Represents an error occurred while converting dev mode to print ticket.
 pub enum FromDevModeError {
-    /// The data is not a whole DEVMODE: its public part is too short, or the data is shorter than
-    /// its `dmSize` and `dmDriverExtra` say.
+    /// The data is not a whole DEVMODE: its public part ends before `dmFields`, or the data is
+    /// shorter than its `dmSize` and `dmDriverExtra` say.
     #[error("Invalid dev mode")]
     InvalidDevMode,
     /// Failed to open print ticket provider.
@@ -279,6 +279,8 @@ mod tests {
         assert_eq!(dev_mode_size(&header(220, 100, 320)), Some(320));
         // Spare bytes after the DEVMODE, as `to_dev_mode` returns it.
         assert_eq!(dev_mode_size(&header(220, 100, 9000)), Some(320));
+        // The smallest public part: the members up to `dmFields`.
+        assert_eq!(dev_mode_size(&header(76, 0, 76)), Some(76));
     }
 
     #[test]
@@ -287,8 +289,9 @@ mod tests {
         assert_eq!(dev_mode_size(&[0u8; 71]), None);
         // Shorter than its own sizes say.
         assert_eq!(dev_mode_size(&header(220, 100, 319)), None);
-        // A public part smaller than any DEVMODEW.
+        // A public part that ends before `dmFields` does.
         assert_eq!(dev_mode_size(&header(72, 0, 72)), None);
+        assert_eq!(dev_mode_size(&header(75, 0, 76)), None);
     }
 
     #[test]
