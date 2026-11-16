@@ -124,6 +124,29 @@ impl DevMode {
         })
     }
 
+    /// Whether these settings ask for image color matching (`dmICMMethod` System, Driver or
+    /// Device, marked valid in `dmFields`). Settings that ask for none, leave the field unmarked
+    /// or predate it (a `dmSize` without it) answer `false`; so do driver-defined methods.
+    #[cfg(any(windows, test))]
+    pub(crate) fn wants_icm(&self) -> bool {
+        const DM_ICMMETHOD: u32 = 0x0080_0000;
+        const ICM_METHOD_AT: usize = 188;
+        let u32_at = |at: usize| {
+            self.0
+                .get(at..at + 4)
+                .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                .map(u32::from_le_bytes)
+        };
+        let size = self
+            .0
+            .get(DM_SIZE_AT..DM_SIZE_AT + 2)
+            .map_or(0, |w| usize::from(u16::from_le_bytes([w[0], w[1]])));
+        // DMICMMETHOD_SYSTEM = 2, DMICMMETHOD_DRIVER = 3, DMICMMETHOD_DEVICE = 4.
+        size >= ICM_METHOD_AT + 4
+            && u32_at(72).is_some_and(|f| f & DM_ICMMETHOD != 0)
+            && u32_at(ICM_METHOD_AT).is_some_and(|m| matches!(m, 2..=4))
+    }
+
     /// Hex, for JSON parameters and remembered print settings.
     pub fn to_hex(&self) -> String {
         self.0.iter().map(|b| format!("{b:02x}")).collect()
@@ -202,7 +225,9 @@ impl Primitive {
 /// One print job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColorPolicy {
-    /// The driver applies its color settings to the RGB image.
+    /// The driver applies its color settings to the RGB image. When those settings ask for
+    /// color matching (`dmICMMethod` System, Driver or Device), ICM is on for the page, so the
+    /// sRGB image is matched as they ask; otherwise ICM is off.
     DriverManaged,
     /// The caller has converted the pixels into the printer's RGB space.
     ApplicationManaged,
@@ -414,6 +439,38 @@ mod tests {
             !DevMode::from_bytes(ignored).unwrap().has_manual_copies(),
             "active driver fields must retain our copy policy"
         );
+    }
+
+    /// Driver-managed RGB follows the settings' own ICM method: an Epson SC-F100 preset with
+    /// dmICMMethod System printed sRGB values unconverted (far too blue) under ICM_OFF and
+    /// matched Photoshop's Printer Manages Colors under ICM_ON.
+    #[test]
+    fn icm_follows_the_settings_icm_method() {
+        let with = |size: u16, fields: u32, method: u32| {
+            let mut b = devmode(size, 16);
+            b[72..76].copy_from_slice(&fields.to_le_bytes());
+            if usize::from(size) >= 192 {
+                b[188..192].copy_from_slice(&method.to_le_bytes());
+            }
+            DevMode::from_bytes(b).unwrap()
+        };
+        const ICM: u32 = 0x0080_0000;
+        for method in [2, 3, 4] {
+            assert!(with(220, ICM, method).wants_icm(), "method {method}");
+        }
+        assert!(!with(220, ICM, 1).wants_icm(), "DMICMMETHOD_NONE");
+        assert!(!with(220, ICM, 0).wants_icm(), "no method");
+        assert!(
+            !with(220, ICM, 256).wants_icm(),
+            "driver-defined methods keep ICM off"
+        );
+        assert!(!with(220, 0, 2).wants_icm(), "dmICMMethod not marked valid");
+        assert!(
+            !with(156, ICM, 2).wants_icm(),
+            "settings too old to carry the field"
+        );
+        // An Epson SC-F100 preset as the driver returns it: dmFields 0x7809b0f, System ICM.
+        assert!(with(220, 0x0780_9b0f, 2).wants_icm());
     }
 
     #[test]
