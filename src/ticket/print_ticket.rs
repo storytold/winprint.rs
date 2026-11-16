@@ -75,24 +75,16 @@ pub enum UserDefaultError {
     /// [`DocumentProperties`]: https://learn.microsoft.com/en-us/windows/win32/printdocs/documentproperties
     #[error("Failed to read the printer's settings via DocumentProperties")]
     FailedToReadDevMode,
-    /// Failed to open print ticket provider.
-    #[error("Failed to open print ticket provider")]
-    OpenProviderFailed(#[source] windows::core::Error),
-    /// Stream not allocated.
-    #[error("Stream not allocated")]
-    StreamNotAllocated,
-    /// Failed to convert dev mode to print ticket.
-    #[error("Failed to convert dev mode to print ticket")]
-    ConvertDevModeToPrintTicketFailed(#[source] windows::core::Error),
-    /// Failed to read the converted print ticket.
-    #[error("Failed to read the converted print ticket")]
-    ReadTicketFailed(#[source] windows::core::Error),
+    /// Failed to convert the settings to a print ticket ([`PrintTicket::from_dev_mode`]).
+    #[error("Failed to convert the settings to a print ticket")]
+    FromDevMode(#[source] FromDevModeError),
 }
 
 impl PrintTicket {
     /// The signed-in user's own default print ticket for the printer: the settings saved in its
     /// Printing Preferences for this user ([`GetPrinter`] level 9), else the printer's defaults,
-    /// settled by the driver ([`DocumentProperties`]) and converted at job scope.
+    /// settled by the driver ([`DocumentProperties`]) and converted at job scope
+    /// ([`PrintTicket::from_dev_mode`]).
     ///
     /// The Print Ticket API completes a ticket merged onto the empty ticket, and answers a
     /// capabilities request without one, from the printer's Printing Defaults, which can differ
@@ -186,29 +178,8 @@ impl PrintTicket {
             {
                 return Err(UserDefaultError::FailedToReadDevMode);
             }
-            // dmSize and dmDriverExtra: the public and private parts of the DEVMODE.
-            let field = |at: usize| u32::from(u16::from_le_bytes([buffer[at], buffer[at + 1]]));
-            let dev_mode_size = field(68) + field(70);
-            if dev_mode_size == 0 || dev_mode_size as usize > buffer.len() {
-                return Err(UserDefaultError::FailedToReadDevMode);
-            }
-
-            let provider = PTOpenProvider(PCWSTR(printer_name.as_ptr()), 1)
-                .map_err(UserDefaultError::OpenProviderFailed)?;
-            defer! {
-                let _ = PTCloseProvider(provider);
-            }
-            let stream = SHCreateMemStream(None).ok_or(UserDefaultError::StreamNotAllocated)?;
-            PTConvertDevModeToPrintTicket(
-                provider,
-                dev_mode_size,
-                buffer.as_ptr() as *const DEVMODEA,
-                kPTJobScope,
-                &stream,
-            )
-            .map_err(UserDefaultError::ConvertDevModeToPrintTicketFailed)?;
-            let xml = read_com_stream(&stream).map_err(UserDefaultError::ReadTicketFailed)?;
-            Ok(Self { xml })
+            let size = dev_mode_size(&buffer).ok_or(UserDefaultError::FailedToReadDevMode)?;
+            Self::from_dev_mode(device, &buffer[..size]).map_err(UserDefaultError::FromDevMode)
         }
     }
 
@@ -308,6 +279,89 @@ impl PrintTicket {
             Ok(buffer)
         }
     }
+
+    /// Convert [`DEVMODE`] data, such as the settings a printer driver's own dialog returns, to a
+    /// job-scope print ticket. `dev_mode` must be for `device`: Windows may replace the settings
+    /// of another printer's driver with defaults. Bytes after the DEVMODE's own size
+    /// (`dmSize + dmDriverExtra`) are ignored, so the buffer [`PrintTicket::to_dev_mode`] returns
+    /// can be passed back as it is.
+    ///
+    /// [`DEVMODE`]: https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-devmodew
+    pub fn from_dev_mode(
+        device: &PrinterDevice,
+        dev_mode: &[u8],
+    ) -> Result<Self, FromDevModeError> {
+        let size = dev_mode_size(dev_mode).ok_or(FromDevModeError::InvalidDevMode)?;
+        // DEVMODEW's fields need their natural alignment, which a byte slice doesn't promise. An
+        // older, shorter DEVMODEW is padded with zeros to the whole structure, so no field read
+        // through it lies outside the buffer.
+        let mut aligned = vec![0u64; size.max(std::mem::size_of::<DEVMODEW>()).div_ceil(8)];
+        for (word, bytes) in aligned.iter_mut().zip(dev_mode[..size].chunks(8)) {
+            let mut padded = [0u8; 8];
+            padded[..bytes.len()].copy_from_slice(bytes);
+            *word = u64::from_ne_bytes(padded);
+        }
+        unsafe {
+            let provider =
+                PTOpenProvider(PCWSTR(wchar::to_wide_chars(device.os_name()).as_ptr()), 1)
+                    .map_err(FromDevModeError::OpenProviderFailed)?;
+            defer! {
+                let _ = PTCloseProvider(provider);
+            }
+            let stream = SHCreateMemStream(None).ok_or(FromDevModeError::StreamNotAllocated)?;
+            PTConvertDevModeToPrintTicket(
+                provider,
+                size as u32,
+                aligned.as_ptr() as *const DEVMODEA,
+                kPTJobScope,
+                &stream,
+            )
+            .map_err(FromDevModeError::ConvertDevModeToPrintTicketFailed)?;
+            let xml = read_com_stream(&stream).map_err(FromDevModeError::ReadPrintTicketFailed)?;
+            Ok(Self { xml })
+        }
+    }
+}
+
+/// Offsets inside DEVMODEW: `dmSize` and `dmDriverExtra` follow the 32-character device name and
+/// two version words.
+const DM_SIZE_AT: usize = 68;
+const DM_DRIVER_EXTRA_AT: usize = 70;
+/// The smallest public part of a DEVMODEW: the members up to `dmFields`.
+const DM_MIN_SIZE: usize = 76;
+
+/// The size of the DEVMODE at the start of `bytes` (`dmSize + dmDriverExtra`); `None` when its
+/// public part ends before `dmFields` does or `bytes` doesn't hold all of it.
+fn dev_mode_size(bytes: &[u8]) -> Option<usize> {
+    let word = |at: usize| {
+        bytes
+            .get(at..at + 2)
+            .map(|w| usize::from(u16::from_le_bytes([w[0], w[1]])))
+    };
+    let public = word(DM_SIZE_AT)?;
+    let size = public + word(DM_DRIVER_EXTRA_AT)?;
+    (public >= DM_MIN_SIZE && size <= bytes.len()).then_some(size)
+}
+
+#[derive(Error, Debug)]
+/// Represents an error occurred while converting dev mode to print ticket.
+pub enum FromDevModeError {
+    /// The data is not a whole DEVMODE: its public part ends before `dmFields`, or the data is
+    /// shorter than its `dmSize` and `dmDriverExtra` say.
+    #[error("Invalid dev mode")]
+    InvalidDevMode,
+    /// Failed to open print ticket provider.
+    #[error("Failed to open print ticket provider")]
+    OpenProviderFailed(#[source] windows::core::Error),
+    /// Stream not allocated.
+    #[error("Stream not allocated")]
+    StreamNotAllocated,
+    /// Failed to convert dev mode to print ticket.
+    #[error("Failed to convert dev mode to print ticket")]
+    ConvertDevModeToPrintTicketFailed(#[source] windows::core::Error),
+    /// Failed to read the converted print ticket.
+    #[error("Failed to read print ticket")]
+    ReadPrintTicketFailed(#[source] windows::core::Error),
 }
 
 impl From<PrintTicketDocument> for PrintTicket {
@@ -320,32 +374,72 @@ impl From<PrintTicketDocument> for PrintTicket {
 
 /// The most a GetPrinter level 9 answer is read at: larger ones are not a user's settings.
 const MAX_PRINTER_INFO: usize = 1 << 20;
-/// The smallest DEVMODEW a driver writes (Windows 95's, up to `dmICMIntent`).
-const MIN_DEV_MODE: usize = 156;
 
-/// Whether `buf` holds a whole DEVMODEW at `offset`: as many bytes as its own `dmSize` and
-/// `dmDriverExtra` say, `dmSize` at least the smallest a driver writes.
+/// Whether `buf` holds a whole DEVMODEW at `offset`, as [`dev_mode_size`] reads one.
 fn dev_mode_within(buf: &[u8], offset: usize) -> bool {
-    let field = |at: usize| {
-        let at = offset.checked_add(at)?;
-        buf.get(at..at.checked_add(2)?)
-            .map(|w| usize::from(u16::from_le_bytes([w[0], w[1]])))
-    };
-    match (field(68), field(70)) {
-        (Some(size), Some(extra)) => {
-            size >= MIN_DEV_MODE
-                && offset
-                    .checked_add(size + extra)
-                    .is_some_and(|end| end <= buf.len())
-        }
-        _ => false,
-    }
+    buf.get(offset..).and_then(dev_mode_size).is_some()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{dev_mode_within, PrintTicket};
+    use super::{dev_mode_size, dev_mode_within, FromDevModeError, PrintTicket};
     use crate::test_utils::null_device;
+
+    const LANDSCAPE: &str = r#"<psf:PrintTicket xmlns:psf="http://schemas.microsoft.com/windows/2003/08/printing/printschemaframework" version="1" xmlns:psk="http://schemas.microsoft.com/windows/2003/08/printing/printschemakeywords">
+    <psf:Feature name="psk:PageOrientation">
+        <psf:Option name="psk:Landscape" />
+    </psf:Feature>
+</psf:PrintTicket>"#;
+
+    /// A DEVMODE header whose `dmSize` and `dmDriverExtra` are `size` and `extra`, `len` bytes long.
+    fn header(size: u16, extra: u16, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; len];
+        bytes[68..70].copy_from_slice(&size.to_le_bytes());
+        bytes[70..72].copy_from_slice(&extra.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn dev_mode_size_is_the_public_and_private_parts() {
+        assert_eq!(dev_mode_size(&header(220, 0, 220)), Some(220));
+        assert_eq!(dev_mode_size(&header(220, 100, 320)), Some(320));
+        // Spare bytes after the DEVMODE, as `to_dev_mode` returns it.
+        assert_eq!(dev_mode_size(&header(220, 100, 9000)), Some(320));
+        // The smallest public part: the members up to `dmFields`.
+        assert_eq!(dev_mode_size(&header(76, 0, 76)), Some(76));
+    }
+
+    #[test]
+    fn dev_mode_size_refuses_a_partial_dev_mode() {
+        assert_eq!(dev_mode_size(&[]), None);
+        assert_eq!(dev_mode_size(&[0u8; 71]), None);
+        // Shorter than its own sizes say.
+        assert_eq!(dev_mode_size(&header(220, 100, 319)), None);
+        // A public part that ends before `dmFields` does.
+        assert_eq!(dev_mode_size(&header(72, 0, 72)), None);
+        assert_eq!(dev_mode_size(&header(75, 0, 76)), None);
+    }
+
+    #[test]
+    fn a_dev_mode_converts_back_to_its_ticket() {
+        let device = null_device::thread_local();
+        let dev_mode = PrintTicket::from_xml(LANDSCAPE)
+            .to_dev_mode(&device)
+            .unwrap();
+        let ticket = PrintTicket::from_dev_mode(&device, &dev_mode).unwrap();
+        let xml = String::from_utf8(ticket.into_xml()).unwrap();
+        assert!(xml.contains("PrintTicket"), "{xml}");
+        assert!(xml.contains("Landscape"), "{xml}");
+    }
+
+    #[test]
+    fn a_partial_dev_mode_is_refused_before_the_driver_reads_it() {
+        let device = null_device::thread_local();
+        let dev_mode = PrintTicket::default().to_dev_mode(&device).unwrap();
+        let size = dev_mode_size(&dev_mode).unwrap();
+        let result = PrintTicket::from_dev_mode(&device, &dev_mode[..size - 1]);
+        assert!(matches!(result, Err(FromDevModeError::InvalidDevMode)));
+    }
 
     /// A GetPrinter level 9 answer: a header, then a DEVMODEW with `size` public and `extra`
     /// private bytes.
@@ -371,7 +465,7 @@ mod tests {
         );
         assert!(!dev_mode_within(&[], 0), "no answer");
         assert!(
-            !dev_mode_within(&answer(8, 100, 0), 8),
+            !dev_mode_within(&answer(8, 75, 0), 8),
             "too small to be settings"
         );
         assert!(
