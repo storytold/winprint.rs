@@ -7,16 +7,22 @@ use std::ffi::c_void;
 use std::path::Path;
 use std::sync::OnceLock;
 use thiserror::Error;
-use windows::core::{s, w, Interface, HRESULT, HSTRING, PCWSTR};
+use windows::core::s;
+use windows::core::w;
+use windows::core::Interface;
+use windows::core::HRESULT;
+use windows::core::HSTRING;
+use windows::core::PCWSTR;
 use windows::Data::Pdf::PdfDocument;
 use windows::Storage::FileAccessMode;
 use windows::Storage::Streams::IRandomAccessStream;
-use windows::Win32::Foundation::{FreeLibrary, E_POINTER};
+use windows::Win32::Foundation::FreeLibrary;
+use windows::Win32::Foundation::E_POINTER;
 use windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_F;
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
-use windows::Win32::System::LibraryLoader::{
-    GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
-};
+use windows::Win32::System::LibraryLoader::GetProcAddress;
+use windows::Win32::System::LibraryLoader::LoadLibraryExW;
+use windows::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_SYSTEM32;
 use windows::Win32::System::WinRT::CreateRandomAccessStreamOnFile;
 use windows::Win32::System::WinRT::Pdf::IPdfRendererNative;
 use windows::Win32::System::WinRT::Pdf::PDF_RENDER_PARAMS;
@@ -63,8 +69,8 @@ pub enum WinPdfPrinterError {
     #[error("Render error")]
     RenderError(#[source] windows::core::Error),
     /// The system's PDF renderer is not available: `windows.data.pdf.dll` could not be loaded
-    /// from the system folder, or it does not export `PdfCreateRenderer`. No print job was
-    /// created.
+    /// from the system folder, or it does not export `PdfCreateRenderer`. The source error is
+    /// the loader's error code. No print job was created.
     #[error("The Windows PDF renderer (windows.data.pdf.dll) is not available on this system")]
     PdfRendererUnavailable(#[source] windows::core::Error),
 }
@@ -441,7 +447,16 @@ mod tests {
 
     #[test]
     fn the_pdf_renderer_resolves_from_the_system_library() {
-        assert!(super::pdf_create_renderer().is_ok());
+        let system_root = std::env::var_os("SystemRoot").unwrap();
+        let installed = std::path::Path::new(&system_root)
+            .join("System32")
+            .join("windows.data.pdf.dll")
+            .is_file();
+        match super::pdf_create_renderer() {
+            Ok(_) => assert!(installed),
+            Err(super::WinPdfPrinterError::PdfRendererUnavailable(_)) => assert!(!installed),
+            Err(error) => panic!("unexpected error: {error}"),
+        }
     }
 
     #[test]
