@@ -109,19 +109,30 @@ impl DevMode {
         Ok(Self(bytes))
     }
 
+    /// The copy count the driver will multiply each page by: `dmCopies` when `dmFields` marks it
+    /// valid, else 1 (a driver without hardware copies may clear the flag and leave any value).
     #[cfg(any(windows, test))]
-    pub(crate) fn has_manual_copies(&self) -> bool {
+    pub(crate) fn driver_copies(&self) -> Option<i16> {
         let fields = self
             .0
             .get(72..76)
             .and_then(|b| <[u8; 4]>::try_from(b).ok())
-            .map(u32::from_le_bytes);
-        // dmFields identifies valid fields. A driver without hardware copies/collation may
-        // clear their flags and return unspecified values; those cannot multiply our pages.
-        fields.is_some_and(|f| {
-            (f & 0x100 == 0 || self.0.get(86..88) == Some(1i16.to_le_bytes().as_slice()))
-                && (f & 0x8000 == 0 || self.0.get(100..102) == Some(0i16.to_le_bytes().as_slice()))
-        })
+            .map(u32::from_le_bytes)?;
+        if fields & 0x100 == 0 {
+            return Some(1);
+        }
+        self.0
+            .get(86..88)
+            .and_then(|b| <[u8; 2]>::try_from(b).ok())
+            .map(i16::from_le_bytes)
+    }
+
+    /// Whether the driver prints each page once, so emitting the copies as pages is exact.
+    /// Collation is not checked: with one copy there is nothing to collate, and many drivers
+    /// report collation on whatever they are asked (#9358).
+    #[cfg(any(windows, test))]
+    pub(crate) fn has_manual_copies(&self) -> bool {
+        self.driver_copies() == Some(1)
     }
 
     /// Hex, for JSON parameters and remembered print settings.
@@ -412,8 +423,26 @@ mod tests {
         ignored[72..76].copy_from_slice(&0x8100u32.to_le_bytes());
         assert!(
             !DevMode::from_bytes(ignored).unwrap().has_manual_copies(),
-            "active driver fields must retain our copy policy"
+            "an active copy count must stay at one"
         );
+    }
+
+    #[test]
+    fn a_driver_that_forces_collation_on_one_copy_still_prints() {
+        // Photocraft #9358: the driver kept DM_COLLATE set and dmCollate = DMCOLLATE_TRUE
+        // although asked for no collation. One copy per page has nothing to collate.
+        let mut bytes = devmode(220, 0);
+        bytes[72..76].copy_from_slice(&0x8100u32.to_le_bytes());
+        bytes[86..88].copy_from_slice(&1i16.to_le_bytes());
+        bytes[100..102].copy_from_slice(&1i16.to_le_bytes());
+        let collated = DevMode::from_bytes(bytes.clone()).unwrap();
+        assert_eq!(collated.driver_copies(), Some(1));
+        assert!(collated.has_manual_copies());
+        // A driver that keeps its own copy count would multiply every emitted page.
+        bytes[86..88].copy_from_slice(&3i16.to_le_bytes());
+        let multiplied = DevMode::from_bytes(bytes).unwrap();
+        assert_eq!(multiplied.driver_copies(), Some(3));
+        assert!(!multiplied.has_manual_copies());
     }
 
     #[test]
