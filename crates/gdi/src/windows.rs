@@ -17,15 +17,22 @@ use windows_sys::Win32::Graphics::Printing::{
     ClosePrinter, DocumentPropertiesW, EnumPrintersW, GetDefaultPrinterW, OpenPrinterW,
     PRINTER_ENUM_CONNECTIONS, PRINTER_ENUM_LOCAL, PRINTER_HANDLE, PRINTER_INFO_4W,
 };
-use windows_sys::Win32::Storage::Xps::{AbortDoc, DOCINFOW, EndDoc, EndPage, StartDocW, StartPage};
+use windows_sys::Win32::Storage::Xps::{
+    AbortDoc, DOCINFOW, EndDoc, EndPage, ExtEscape, StartDocW, StartPage,
+};
 use windows_sys::Win32::UI::ColorSystem::{ICM_DONE_OUTSIDEDC, ICM_OFF, SetICMMode};
 
 use crate::{
-    ColorPolicy, DevMode, Job, Page, Primitive, PrintError, Printed, Printer, Result, RgbImage,
-    Shape,
+    ColorPolicy, DevMode, Job, Page, PostScriptJob, PostScriptSheet, Primitive, PrintError,
+    Printed, Printer, Result, RgbImage, Shape,
 };
 
 const IDOK: i32 = 1;
+/// `ExtEscape` codes (wingdi.h).
+const QUERYESCSUPPORT: i32 = 8;
+const POSTSCRIPT_PASSTHROUGH: i32 = 4115;
+/// The escape's data starts with a 16-bit byte count, so PostScript goes in chunks.
+const PASSTHROUGH_CHUNK: usize = 32 * 1024;
 const IDCANCEL: i32 = 2;
 /// Wide strings read from the system stop here at the latest.
 const MAX_WCHARS: usize = 32 * 1024;
@@ -295,6 +302,39 @@ impl Dc {
     }
 }
 
+impl Dc {
+    fn escape_supported(&self, escape: i32) -> bool {
+        let code = escape.to_le_bytes();
+        // SAFETY: a valid DC; QUERYESCSUPPORT reads the 4-byte escape code and writes nothing.
+        unsafe { ExtEscape(self.0, QUERYESCSUPPORT, 4, code.as_ptr(), 0, null_mut()) > 0 }
+    }
+
+    fn pass_through(&self, data: &[u8]) -> Result<()> {
+        let mut buffer = Vec::with_capacity(PASSTHROUGH_CHUNK + 2);
+        for chunk in data.chunks(PASSTHROUGH_CHUNK) {
+            buffer.clear();
+            buffer.extend_from_slice(&(chunk.len() as u16).to_le_bytes());
+            buffer.extend_from_slice(chunk);
+            // SAFETY: a valid DC inside a page; `buffer` is the count word and that many bytes,
+            // alive for the call; the escape writes nothing back.
+            let sent = unsafe {
+                ExtEscape(
+                    self.0,
+                    POSTSCRIPT_PASSTHROUGH,
+                    buffer.len() as i32,
+                    buffer.as_ptr(),
+                    0,
+                    null_mut(),
+                )
+            };
+            if sent <= 0 {
+                return Err(last_error("sending PostScript to the printer"));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Drop for Dc {
     fn drop(&mut self) {
         // SAFETY: the DC came from CreateDCW and is deleted once.
@@ -521,6 +561,63 @@ pub fn print(job: &Job<'_>, image: &RgbImage<'_>, rect: (f64, f64, f64, f64)) ->
         device_rect: (x, y, w, h),
         dpi: page.dpi,
     })
+}
+
+pub fn postscript_passthrough(printer: &str, settings: Option<&DevMode>) -> Result<bool> {
+    Ok(Dc::create(printer, settings, false)?.escape_supported(POSTSCRIPT_PASSTHROUGH))
+}
+
+pub fn print_postscript(
+    job: &PostScriptJob<'_>,
+    sheets: &[PostScriptSheet<'_>],
+    progress: &mut dyn FnMut(usize),
+) -> Result<()> {
+    let dc = Dc::create(job.printer, job.settings, false)?;
+    if !dc.escape_supported(POSTSCRIPT_PASSTHROUGH) {
+        return Err(PrintError::Invalid(format!(
+            "the driver of “{}” does not take PostScript",
+            job.printer
+        )));
+    }
+    let page = dc.page()?;
+    let title = wide(job.title)?;
+    let output = job.output_file.map(wide).transpose()?;
+    let info = DOCINFOW {
+        cbSize: std::mem::size_of::<DOCINFOW>() as i32,
+        lpszDocName: title.as_ptr(),
+        lpszOutput: output.as_ref().map_or(null(), |o| o.as_ptr()),
+        lpszDatatype: null(),
+        fwType: 0,
+    };
+    // SAFETY: `info` and the strings it points to live until EndDoc/AbortDoc below.
+    if unsafe { StartDocW(dc.0, &info) } <= 0 {
+        return Err(last_error("starting the print job"));
+    }
+    let abort = |error: PrintError| {
+        // SAFETY: the job was started on this DC.
+        unsafe { AbortDoc(dc.0) };
+        error
+    };
+    for (i, sheet) in sheets.iter().enumerate() {
+        // SAFETY: inside a started document on a valid DC.
+        if unsafe { StartPage(dc.0) } <= 0 {
+            return Err(abort(last_error("starting a page")));
+        }
+        let (head, tail) = crate::postscript_wrapper(&page, sheet);
+        for part in [head.as_bytes(), sheet.eps, tail.as_bytes()] {
+            dc.pass_through(part).map_err(abort)?;
+        }
+        // SAFETY: closes the page started above.
+        if unsafe { EndPage(dc.0) } <= 0 {
+            return Err(abort(last_error("finishing a page")));
+        }
+        progress(i + 1);
+    }
+    // SAFETY: closes the document started above.
+    if unsafe { EndDoc(dc.0) } <= 0 {
+        return Err(last_error("finishing the print job"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
