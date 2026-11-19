@@ -71,6 +71,23 @@ pub enum DxgiPrintContextError {
 
 const DEFAULT_DPI: u32 = 300;
 
+/// Copy raw `DEVMODEW` bytes into a 64-bit aligned buffer when long enough to hold the fixed header.
+fn aligned_dev_mode(bytes: &[u8]) -> Option<Vec<u64>> {
+    if bytes.len() < std::mem::size_of::<DEVMODEW>() {
+        return None;
+    }
+    let mut aligned = vec![0u64; bytes.len().div_ceil(8)];
+    // SAFETY: `aligned` holds at least `bytes.len()` writable bytes and neither overlaps the other.
+    unsafe {
+        ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            aligned.as_mut_ptr().cast::<u8>(),
+            bytes.len(),
+        );
+    }
+    Some(aligned)
+}
+
 /// The resolution that `dev_mode` asks for, taking one axis for the other when it asks for only
 /// one, or [`DEFAULT_DPI`] when it asks for none. `dmPrintQuality` can hold a negative `DMRES_*`
 /// quality level instead of a resolution; that is not a resolution and is ignored.
@@ -117,13 +134,26 @@ impl DxgiPrintContext {
         options: &PrintTicket,
         job_name: &OsStr,
     ) -> Result<Self, DxgiPrintContextError> {
+        let dev_mode = options
+            .to_dev_mode(device)
+            .map_err(DxgiPrintContextError::PrintTicketError)?;
+        Self::new_with_dev_mode(device, options, &dev_mode, job_name)
+    }
+
+    /// Create a new print context using a pre-converted `DEVMODEW` byte buffer to avoid a second
+    /// PrintTicket-to-DEVMODE driver conversion when the caller already computed one.
+    pub fn new_with_dev_mode(
+        device: &PrinterDevice,
+        options: &PrintTicket,
+        dev_mode: &[u8],
+        job_name: &OsStr,
+    ) -> Result<Self, DxgiPrintContextError> {
         // Initialize COM before calling any COM functions.
         let _com_initializer = ComInitializer::new();
+        let dpi = aligned_dev_mode(dev_mode)
+            .map(|buf| unsafe { resolution(&*(buf.as_ptr() as *const DEVMODEW)) })
+            .unwrap_or((DEFAULT_DPI, DEFAULT_DPI));
         unsafe {
-            let dev_mode = options
-                .to_dev_mode(device)
-                .map_err(DxgiPrintContextError::PrintTicketError)?;
-            let dpi = resolution(&*(dev_mode.as_ptr() as *const DEVMODEW));
             let mut d3d_device: Option<ID3D11Device> = None;
             let mut d3d_context: Option<ID3D11DeviceContext> = None;
             D3D11CreateDevice(
@@ -152,11 +182,9 @@ impl DxgiPrintContext {
             // Windows.Data.Pdf renders a page on several worker threads that share this
             // device context. A single-threaded factory has no locking, so they race inside
             // d2d1.dll (access violations reading near null or calling freed memory).
-            let d2d_factory: ID2D1Factory1 = D2D1CreateFactory(
-                D2D1_FACTORY_TYPE_MULTI_THREADED,
-                Some(&d2d_factory_options),
-            )
-            .map_err(DxgiPrintContextError::InitializeDirectX)?;
+            let d2d_factory: ID2D1Factory1 =
+                D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, Some(&d2d_factory_options))
+                    .map_err(DxgiPrintContextError::InitializeDirectX)?;
 
             let d2d_device = d2d_factory
                 .CreateDevice(&dxgi_device)
@@ -262,7 +290,7 @@ impl Drop for DxgiPrintContext {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolution, DEFAULT_DPI};
+    use super::{aligned_dev_mode, resolution, DEFAULT_DPI};
     use windows::Win32::Graphics::Gdi::{DEVMODEW, DMRES_HIGH, DM_PRINTQUALITY, DM_YRESOLUTION};
 
     fn dev_mode(quality: Option<i16>, y: Option<i16>) -> DEVMODEW {
@@ -296,5 +324,22 @@ mod tests {
             resolution(&dev_mode(None, None)),
             (DEFAULT_DPI, DEFAULT_DPI)
         );
+    }
+
+    #[test]
+    fn aligned_dev_mode_rejects_short_buffers_and_aligns_valid_headers() {
+        let too_short = vec![0u8; std::mem::size_of::<DEVMODEW>() - 1];
+        assert!(aligned_dev_mode(&too_short).is_none());
+
+        let buf = vec![0x5Au8; std::mem::size_of::<DEVMODEW>() + 3];
+        let aligned = aligned_dev_mode(&buf).unwrap();
+        assert_eq!(
+            aligned
+                .as_ptr()
+                .align_offset(std::mem::align_of::<DEVMODEW>()),
+            0
+        );
+        let raw = unsafe { std::slice::from_raw_parts(aligned.as_ptr().cast::<u8>(), buf.len()) };
+        assert_eq!(raw, buf.as_slice());
     }
 }

@@ -4,9 +4,11 @@ use std::ffi::{OsStr, OsString};
 use std::mem;
 use std::ptr;
 use thiserror::Error;
-use windows::core::PCWSTR;
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+use windows::Win32::Graphics::Gdi::{CreateDCW, DeleteDC};
 use windows::Win32::Graphics::Printing::*;
+use windows::Win32::Storage::Xps::ExtEscape;
 #[derive(Clone, Debug)]
 /// Represents a printer device.
 pub struct PrinterDevice {
@@ -196,11 +198,44 @@ impl PrinterDevice {
             Ok(info.dwPrinterDriverAttributes & PRINTER_DRIVER_XPS != 0)
         }
     }
+
+    /// Whether the printer's driver accepts raw PostScript passthrough (`POSTSCRIPT_PASSTHROUGH`),
+    /// which indicates a v3 PostScript GDI driver.
+    pub fn is_postscript_driver(&self) -> Result<bool, DriverInfoError> {
+        const QUERYESCSUPPORT: i32 = 8;
+        const POSTSCRIPT_PASSTHROUGH: i32 = 4115;
+
+        let printer_name = wchar::to_wide_chars(self.os_name());
+        unsafe {
+            let hdc = CreateDCW(w!("WINSPOOL"), PCWSTR(printer_name.as_ptr()), None, None);
+            if hdc.is_invalid() {
+                return Err(DriverInfoError::FailedToOpenPrinter(
+                    windows::core::Error::from_thread(),
+                ));
+            }
+            scopeguard::defer! {
+                let _ = DeleteDC(hdc);
+            }
+            let escape = POSTSCRIPT_PASSTHROUGH.to_ne_bytes();
+            let supported = ExtEscape(hdc, QUERYESCSUPPORT, Some(&escape), None);
+            Ok(supported > 0)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            os_server: OsString::new(),
+            os_name: OsString::from(name),
+            os_attributes: PRINTER_ATTRIBUTE_LOCAL,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::PrinterDevice;
+    use super::{DriverInfoError, PrinterDevice};
     use crate::test_utils::null_device;
 
     #[test]
@@ -214,6 +249,18 @@ mod tests {
     fn a_printer_says_whether_its_driver_renders_xps() {
         let device = null_device::thread_local();
         device.is_xps_driver().unwrap();
+    }
+
+    #[test]
+    fn postscript_driver_probe_errors_for_missing_queue_and_reads_installed() {
+        let missing = PrinterDevice::for_test("winprint-missing-queue-9f31e2");
+        assert!(matches!(
+            missing.is_postscript_driver(),
+            Err(DriverInfoError::FailedToOpenPrinter(_))
+        ));
+        if let Some(installed) = PrinterDevice::all().unwrap().into_iter().next() {
+            assert!(installed.is_postscript_driver().is_ok());
+        }
     }
 
     #[test]
