@@ -79,6 +79,11 @@ The narrow changes used by craft-print are:
   document loading. Adding cancellation requires keeping the stream and temporary
   file alive until the native operation has actually stopped; returning from a
   timeout alone is not sufficient. This remains a known limitation of the loader.
+- `PdfCreateRenderer` is not imported when the program loads. `WinPdfPrinter` loads
+  `windows.data.pdf.dll` from the system folder the first time it prints, so the
+  loader does not require that DLL to start a program that links this crate.
+  Printing without it returns `WinPdfPrinterError::PdfRendererUnavailable` before a
+  job is created.
 - `WinPdfPrinter::print_with_progress(path, ticket, callback)` reports `(processed,
   total)` after each successful Direct2D AddPage, preserving one job and its ticket.
   These counts measure page processing, never physical printing or terminal success.

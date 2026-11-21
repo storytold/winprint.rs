@@ -3,15 +3,28 @@ use super::DxgiPrintContextError;
 use crate::printer::FilePrinter;
 use crate::printer::PrinterDevice;
 use crate::ticket::PrintTicket;
+use std::ffi::c_void;
 use std::path::Path;
+use std::sync::OnceLock;
 use thiserror::Error;
+use windows::core::s;
+use windows::core::w;
+use windows::core::Interface;
+use windows::core::HRESULT;
 use windows::core::HSTRING;
+use windows::core::PCWSTR;
 use windows::Data::Pdf::PdfDocument;
 use windows::Storage::FileAccessMode;
 use windows::Storage::Streams::IRandomAccessStream;
+use windows::Win32::Foundation::FreeLibrary;
+use windows::Win32::Foundation::E_POINTER;
 use windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_F;
+use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::System::LibraryLoader::GetProcAddress;
+use windows::Win32::System::LibraryLoader::LoadLibraryExW;
+use windows::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_SYSTEM32;
 use windows::Win32::System::WinRT::CreateRandomAccessStreamOnFile;
-use windows::Win32::System::WinRT::Pdf::PdfCreateRenderer;
+use windows::Win32::System::WinRT::Pdf::IPdfRendererNative;
 use windows::Win32::System::WinRT::Pdf::PDF_RENDER_PARAMS;
 use windows_numerics::Matrix3x2;
 
@@ -55,6 +68,68 @@ pub enum WinPdfPrinterError {
     /// Render error.
     #[error("Render error")]
     RenderError(#[source] windows::core::Error),
+    /// The system's PDF renderer is not available: `windows.data.pdf.dll` could not be loaded
+    /// from the system folder, or it does not export `PdfCreateRenderer`. The source error is
+    /// the loader's error code. No print job was created.
+    #[error("The Windows PDF renderer (windows.data.pdf.dll) is not available on this system")]
+    PdfRendererUnavailable(#[source] windows::core::Error),
+}
+
+/// The system library that exports
+/// [`PdfCreateRenderer`](https://learn.microsoft.com/windows/win32/api/windows.data.pdf.interop/nf-windows-data-pdf-interop-pdfcreaterenderer).
+const PDF_LIBRARY: PCWSTR = w!("windows.data.pdf.dll");
+
+type PdfCreateRendererFn = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
+
+/// `PdfCreateRenderer`, looked up the first time a PDF is printed and kept for the process.
+///
+/// The function is not imported when the program loads: a program that imports a missing DLL
+/// does not start at all, and some Windows installations do not have `windows.data.pdf.dll`.
+/// On those, printing a PDF returns [`WinPdfPrinterError::PdfRendererUnavailable`].
+fn pdf_create_renderer() -> Result<PdfCreateRendererFn, WinPdfPrinterError> {
+    static RESOLVED: OnceLock<Result<PdfCreateRendererFn, HRESULT>> = OnceLock::new();
+    let resolved =
+        RESOLVED.get_or_init(|| resolve_pdf_create_renderer(PDF_LIBRARY).map_err(|e| e.code()));
+    resolved.map_err(|code| WinPdfPrinterError::PdfRendererUnavailable(code.into()))
+}
+
+/// Load `library` from the system folder and look up its `PdfCreateRenderer`.
+fn resolve_pdf_create_renderer(library: PCWSTR) -> windows::core::Result<PdfCreateRendererFn> {
+    // SAFETY: `library` is a NUL-terminated wide string. LOAD_LIBRARY_SEARCH_SYSTEM32 loads
+    // only the copy in the system folder, never a file of the same name next to the program
+    // or in the current folder. The module stays loaded for the rest of the process, so the
+    // returned function pointer stays valid.
+    let module = unsafe { LoadLibraryExW(library, None, LOAD_LIBRARY_SEARCH_SYSTEM32) }?;
+    // SAFETY: `module` was loaded above and the name is a NUL-terminated ANSI string.
+    let Some(address) = (unsafe { GetProcAddress(module, s!("PdfCreateRenderer")) }) else {
+        let error = windows::core::Error::from_thread();
+        // SAFETY: nothing from the module is in use.
+        let _ = unsafe { FreeLibrary(module) };
+        return Err(error);
+    };
+    // SAFETY: PdfCreateRenderer takes an IDXGIDevice and an out pointer to an
+    // IPdfRendererNative, and returns an HRESULT (windows.data.pdf.interop.h).
+    Ok(unsafe {
+        std::mem::transmute::<unsafe extern "system" fn() -> isize, PdfCreateRendererFn>(address)
+    })
+}
+
+/// Create the renderer that draws PDF pages into `device`'s Direct2D device contexts.
+fn create_pdf_renderer(
+    create: PdfCreateRendererFn,
+    device: &IDXGIDevice,
+) -> Result<IPdfRendererNative, WinPdfPrinterError> {
+    let mut renderer = std::ptr::null_mut();
+    // SAFETY: `device` holds a reference for the duration of the call. On success the out
+    // pointer holds a reference to the new renderer, which `from_raw` takes over.
+    unsafe { create(device.as_raw(), &mut renderer) }
+        .ok()
+        .map_err(WinPdfPrinterError::RenderError)?;
+    if renderer.is_null() {
+        return Err(WinPdfPrinterError::RenderError(E_POINTER.into()));
+    }
+    // SAFETY: `renderer` is a non-null IPdfRendererNative that nothing else releases.
+    Ok(unsafe { IPdfRendererNative::from_raw(renderer) })
 }
 
 /// A printer that uses [`Windows.Data.Pdf`](https://learn.microsoft.com/en-us/uwp/api/windows.data.pdf?view=winrt-26100) to to print PDF documents.
@@ -111,6 +186,8 @@ impl WinPdfPrinter {
         options: PrintTicket,
         mut progress: impl FnMut(u32, u32),
     ) -> Result<(), WinPdfPrinterError> {
+        // Before the job is created, so a system without the renderer gets no empty job.
+        let create_renderer = pdf_create_renderer()?;
         let context = DxgiPrintContext::new(
             &self.printer,
             &options,
@@ -127,8 +204,7 @@ impl WinPdfPrinter {
         unsafe {
             let pdf_document = load_document(path)?;
 
-            let pdf_renderer =
-                PdfCreateRenderer(dxgi_device).map_err(WinPdfPrinterError::RenderError)?;
+            let pdf_renderer = create_pdf_renderer(create_renderer, dxgi_device)?;
             let page_count = pdf_document
                 .PageCount()
                 .map_err(WinPdfPrinterError::RenderError)?;
@@ -367,5 +443,108 @@ mod tests {
         assert!(scaled(0.0, 1.0).is_err());
         assert!(scaled(f32::NAN, 1.0).is_err());
         assert!(scaled(1e12, 100.0).is_err());
+    }
+
+    #[test]
+    fn the_pdf_renderer_resolves_from_the_system_library() {
+        let system_root = std::env::var_os("SystemRoot").unwrap();
+        let installed = std::path::Path::new(&system_root)
+            .join("System32")
+            .join("windows.data.pdf.dll")
+            .is_file();
+        match super::pdf_create_renderer() {
+            Ok(_) => assert!(installed),
+            Err(super::WinPdfPrinterError::PdfRendererUnavailable(_)) => assert!(!installed),
+            Err(error) => panic!("unexpected error: {error}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_pdf_library_is_an_error() {
+        use windows::Win32::Foundation::ERROR_MOD_NOT_FOUND;
+        let error =
+            super::resolve_pdf_create_renderer(windows::core::w!("winprint-no-such-library.dll"))
+                .err()
+                .unwrap();
+        assert_eq!(error.code(), ERROR_MOD_NOT_FOUND.to_hresult());
+    }
+
+    #[test]
+    fn a_library_without_the_renderer_export_is_an_error() {
+        use windows::Win32::Foundation::ERROR_PROC_NOT_FOUND;
+        let error = super::resolve_pdf_create_renderer(windows::core::w!("kernel32.dll"))
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), ERROR_PROC_NOT_FOUND.to_hresult());
+    }
+
+    #[test]
+    fn an_unavailable_renderer_names_the_library() {
+        use windows::Win32::Foundation::ERROR_MOD_NOT_FOUND;
+        let error = super::WinPdfPrinterError::PdfRendererUnavailable(
+            ERROR_MOD_NOT_FOUND.to_hresult().into(),
+        );
+        assert!(error.to_string().contains("windows.data.pdf.dll"));
+    }
+
+    /// The names of the DLLs in a PE image's import directory, which the loader must find
+    /// before the program starts.
+    fn imported_libraries(image: &[u8]) -> Vec<String> {
+        let u16_at = |at: usize| u16::from_le_bytes(image[at..at + 2].try_into().unwrap());
+        let u32_at = |at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
+        let pe = u32_at(0x3c) as usize;
+        assert_eq!(&image[pe..pe + 4], b"PE\0\0");
+        let coff = pe + 4;
+        let sections = u16_at(coff + 2) as usize;
+        let optional = coff + 20;
+        let section_table = optional + u16_at(coff + 16) as usize;
+        // The data directories start 96 bytes into a PE32 optional header and 112 bytes into a
+        // PE32+ one; the import directory is the second.
+        let directories = optional
+            + match u16_at(optional) {
+                0x10b => 96,
+                0x20b => 112,
+                magic => panic!("unknown optional header magic {magic:#x}"),
+            };
+        let offset = |rva: u32| -> usize {
+            (0..sections)
+                .find_map(|i| {
+                    let section = section_table + i * 40;
+                    let size = u32_at(section + 8).max(u32_at(section + 16));
+                    let address = u32_at(section + 12);
+                    (rva >= address && rva - address < size)
+                        .then(|| (rva - address + u32_at(section + 20)) as usize)
+                })
+                .unwrap()
+        };
+        let mut libraries = Vec::new();
+        let mut descriptor = offset(u32_at(directories + 8));
+        loop {
+            let name = u32_at(descriptor + 12);
+            if name == 0 {
+                break;
+            }
+            let name = &image[offset(name)..];
+            let end = name.iter().position(|&b| b == 0).unwrap();
+            libraries.push(String::from_utf8_lossy(&name[..end]).to_ascii_lowercase());
+            descriptor += 20;
+        }
+        libraries
+    }
+
+    /// This test binary contains `WinPdfPrinter::print_with_progress` (the tests above print
+    /// with it), so a load-time import of the renderer would appear in its import directory.
+    #[test]
+    fn the_pdf_library_is_not_imported_at_load_time() {
+        let image = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let libraries = imported_libraries(&image);
+        assert!(
+            libraries.iter().any(|l| l == "kernel32.dll"),
+            "{libraries:?}"
+        );
+        assert!(
+            !libraries.iter().any(|l| l == "windows.data.pdf.dll"),
+            "{libraries:?}"
+        );
     }
 }
