@@ -83,6 +83,21 @@ impl DevMode {
         &self.0
     }
 
+    /// The settings a spooler buffer holds at `offset` (where its `pDevMode` points, from the
+    /// buffer's start), as many bytes as their own `dmSize` and `dmDriverExtra` say. `None` when
+    /// that runs past the buffer or the settings fail [`DevMode::from_bytes`].
+    #[cfg(any(windows, test))]
+    pub(crate) fn in_buffer(buf: &[u8], offset: usize) -> Option<Self> {
+        let word = |at: usize| {
+            let at = offset.checked_add(at)?;
+            buf.get(at..at.checked_add(2)?)
+                .map(|w| usize::from(u16::from_le_bytes([w[0], w[1]])))
+        };
+        let len = word(DM_SIZE_AT)?.checked_add(word(DM_EXTRA_AT)?)?;
+        let bytes = buf.get(offset..offset.checked_add(len)?)?;
+        DevMode::from_bytes(bytes.to_vec()).ok()
+    }
+
     /// The application emits every copy as a page. Disable driver copies/collation too,
     /// preserving the driver's private settings and all other public fields.
     #[cfg(any(windows, test))]
@@ -290,6 +305,22 @@ pub fn default_settings(printer: &str) -> Result<DevMode> {
     }
 }
 
+/// The signed-in user's own settings for `printer`: what they saved in its Printing Preferences
+/// (GetPrinter level 9), settled by the driver, else the printer's defaults. Programs such as
+/// Acrobat print with these; the printer's Printing Defaults can hold another stock, darkness
+/// or cutter setting. Level 9 is only served to an interactive session.
+pub fn user_settings(printer: &str) -> Result<DevMode> {
+    #[cfg(windows)]
+    {
+        windows::user_settings(printer)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = printer;
+        Err(PrintError::Unsupported)
+    }
+}
+
 /// Shows the driver's Print Settings dialog (modal; `parent` is a window handle). `None` when
 /// the user cancels.
 pub fn settings_dialog(
@@ -323,23 +354,46 @@ pub fn page(printer: &str, settings: Option<&DevMode>) -> Result<Page> {
 
 /// Prints `image` into `rect` (points, origin top-left of the sheet), `job.copies` pages.
 pub fn print(job: &Job<'_>, image: &RgbImage<'_>, rect: (f64, f64, f64, f64)) -> Result<Printed> {
-    let row = (image.width as usize)
-        .checked_mul(3)
-        .ok_or_else(|| PrintError::Invalid("image too large".into()))?;
-    if image.width == 0
-        || image.height == 0
-        || row.checked_mul(image.height as usize) != Some(image.data.len())
-    {
+    print_pages(job, &[(image, rect)])
+}
+
+/// One page of a [`print_pages`] job: the picture and where it goes on the sheet (points, origin
+/// top-left: x, y, width, height).
+pub type PagePicture<'a, 'b> = (&'a RgbImage<'b>, (f64, f64, f64, f64));
+
+/// The most pages one [`print_pages`] job takes.
+pub const MAX_PAGES: usize = 10_000;
+
+/// Prints each `(image, rect)` as one page of a single job (rect in points, origin top-left of the
+/// sheet), the whole set `job.copies` times. An image whose pixels are exactly the device pixels
+/// of its rect (rendered at the printer's resolution) is copied pixel for pixel; a scaled one is
+/// resampled with halftoning. Copying matters on thermal label printers: their drivers dither
+/// any grey, and resampling a black-and-white picture makes greys at every edge.
+pub fn print_pages(job: &Job<'_>, pages: &[PagePicture<'_, '_>]) -> Result<Printed> {
+    if pages.is_empty() || pages.len() > MAX_PAGES {
         return Err(PrintError::Invalid("nothing to print".into()));
     }
-    if ![rect.0, rect.1, rect.2, rect.3]
-        .iter()
-        .all(|v| v.is_finite())
-        || !(rect.2 > 0.0 && rect.3 > 0.0)
-    {
-        return Err(PrintError::Invalid("the print size is empty".into()));
+    let mut total = 0usize;
+    for (image, rect) in pages {
+        let row = (image.width as usize)
+            .checked_mul(3)
+            .ok_or_else(|| PrintError::Invalid("image too large".into()))?;
+        if image.width == 0
+            || image.height == 0
+            || row.checked_mul(image.height as usize) != Some(image.data.len())
+        {
+            return Err(PrintError::Invalid("nothing to print".into()));
+        }
+        if ![rect.0, rect.1, rect.2, rect.3]
+            .iter()
+            .all(|v| v.is_finite())
+            || !(rect.2 > 0.0 && rect.3 > 0.0)
+        {
+            return Err(PrintError::Invalid("the print size is empty".into()));
+        }
+        total = total.saturating_add(image.data.len());
     }
-    if image.data.len() > 512 * 1024 * 1024
+    if total > 512 * 1024 * 1024
         || job.primitives.len() > 10_000
         || job.primitives.iter().any(|p| !p.valid())
     {
@@ -349,13 +403,18 @@ pub fn print(job: &Job<'_>, image: &RgbImage<'_>, rect: (f64, f64, f64, f64)) ->
     }
     #[cfg(windows)]
     {
-        windows::print(job, image, rect)
+        windows::print(job, pages)
     }
     #[cfg(not(windows))]
     {
         let _ = job;
         Err(PrintError::Unsupported)
     }
+}
+
+/// Whether an image drawn at `device` (width, height in device pixels) needs no resampling.
+pub fn is_device_size(image: &RgbImage<'_>, device: (i32, i32)) -> bool {
+    i64::from(image.width) == i64::from(device.0) && i64::from(image.height) == i64::from(device.1)
 }
 
 #[cfg(test)]
@@ -386,6 +445,35 @@ mod tests {
         }
     }
 
+    /// The user's settings as GetPrinter level 9 returns them: a PRINTER_INFO_9W whose
+    /// `pDevMode` points further into the same buffer.
+    #[test]
+    fn settings_are_read_from_a_spooler_buffer_only_within_it() {
+        let settings = devmode(220, 1200);
+        let mut buf = vec![0xa5u8; 8];
+        buf.extend_from_slice(&settings);
+        assert_eq!(
+            DevMode::in_buffer(&buf, 8),
+            Some(DevMode::from_bytes(settings.clone()).unwrap())
+        );
+        // A driver's private part past the end of the buffer, or an offset past it.
+        assert_eq!(DevMode::in_buffer(&buf[..buf.len() - 1], 8), None);
+        assert_eq!(DevMode::in_buffer(&buf, buf.len()), None);
+        assert_eq!(DevMode::in_buffer(&buf, usize::MAX), None);
+        // An empty buffer, and settings whose own sizes are too small to be settings.
+        assert_eq!(DevMode::in_buffer(&[], 0), None);
+        let mut short = vec![0u8; 8];
+        short.extend_from_slice(&devmode(100, 0));
+        assert_eq!(DevMode::in_buffer(&short, 8), None);
+        // The largest private part a header can describe is read whole, and nothing after it.
+        let mut big = devmode(220, u16::MAX);
+        big.extend_from_slice(&[0xa5; 16]);
+        assert_eq!(
+            DevMode::in_buffer(&big, 0).map(|d| d.as_bytes().len()),
+            Some(220 + usize::from(u16::MAX))
+        );
+    }
+
     #[test]
     fn manual_copies_disable_driver_multiplication_without_losing_private_settings() {
         let mut bytes = devmode(220, 32);
@@ -414,6 +502,60 @@ mod tests {
             !DevMode::from_bytes(ignored).unwrap().has_manual_copies(),
             "active driver fields must retain our copy policy"
         );
+    }
+
+    #[test]
+    fn only_a_picture_at_the_device_pixels_counts_as_device_size() {
+        let data = vec![255u8; 4 * 2 * 3];
+        let image = RgbImage {
+            width: 4,
+            height: 2,
+            data: &data,
+        };
+        assert!(is_device_size(&image, (4, 2)));
+        assert!(
+            !is_device_size(&image, (4, 3))
+                && !is_device_size(&image, (8, 4))
+                && !is_device_size(&image, (-4, 2))
+        );
+    }
+
+    #[test]
+    fn a_multi_page_job_checks_every_page() {
+        let job = Job {
+            printer: "none",
+            settings: None,
+            title: "t",
+            output_file: None,
+            copies: 1,
+            color_policy: ColorPolicy::Unmanaged,
+            primitives: &[],
+        };
+        let good = vec![0u8; 2 * 2 * 3];
+        let bad = vec![0u8; 5];
+        let ok = RgbImage {
+            width: 2,
+            height: 2,
+            data: &good,
+        };
+        let broken = RgbImage {
+            width: 2,
+            height: 2,
+            data: &bad,
+        };
+        let rect = (0.0, 0.0, 72.0, 72.0);
+        assert!(matches!(
+            print_pages(&job, &[]),
+            Err(PrintError::Invalid(_))
+        ));
+        assert!(matches!(
+            print_pages(&job, &[(&ok, rect), (&broken, rect)]),
+            Err(PrintError::Invalid(_))
+        ));
+        assert!(matches!(
+            print_pages(&job, &[(&ok, (0.0, 0.0, 0.0, 72.0))]),
+            Err(PrintError::Invalid(_))
+        ));
     }
 
     #[test]
