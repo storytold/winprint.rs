@@ -109,13 +109,40 @@ impl WinPdfPrinter {
         &self,
         path: &Path,
         options: PrintTicket,
-        mut progress: impl FnMut(u32, u32),
+        progress: impl FnMut(u32, u32),
     ) -> Result<(), WinPdfPrinterError> {
         let context = DxgiPrintContext::new(
             &self.printer,
             &options,
             path.file_name().unwrap_or(path.as_ref()),
         )?;
+        self.print_with_context(context, path, progress)
+    }
+
+    /// Print one PDF using a pre-converted `DEVMODEW` byte buffer to avoid a duplicate
+    /// PrintTicket-to-DEVMODE conversion when the caller already computed one.
+    pub fn print_with_dev_mode_and_progress(
+        &self,
+        path: &Path,
+        options: PrintTicket,
+        dev_mode: &[u8],
+        progress: impl FnMut(u32, u32),
+    ) -> Result<(), WinPdfPrinterError> {
+        let context = DxgiPrintContext::new_with_dev_mode(
+            &self.printer,
+            &options,
+            dev_mode,
+            path.file_name().unwrap_or(path.as_ref()),
+        )?;
+        self.print_with_context(context, path, progress)
+    }
+
+    fn print_with_context(
+        &self,
+        context: DxgiPrintContext,
+        path: &Path,
+        mut progress: impl FnMut(u32, u32),
+    ) -> Result<(), WinPdfPrinterError> {
         let dxgi_device = &context.dxgi_device;
         let print_control = &context.print_control;
         let d2d_context = &context.d2d_context;
@@ -199,7 +226,7 @@ impl WinPdfPrinter {
 // StorageFile's broker can refuse otherwise readable desktop job files. Open a
 // read-only, file-backed WinRT stream directly: no whole-file copy and no per-chunk
 // DataWriter/StoreAsync operations. The PDF renderer reads the file on demand.
-fn open_document_stream(path: &Path) -> Result<IRandomAccessStream, WinPdfPrinterError> {
+pub(crate) fn open_document_stream(path: &Path) -> Result<IRandomAccessStream, WinPdfPrinterError> {
     // On Windows, absolute also rejects embedded NULs before any native stream call.
     let absolute_path = std::path::absolute(path).map_err(WinPdfPrinterError::InvalidPath)?;
     let file_path = HSTRING::from(absolute_path.as_path());
@@ -210,7 +237,7 @@ fn open_document_stream(path: &Path) -> Result<IRandomAccessStream, WinPdfPrinte
         .map_err(WinPdfPrinterError::FailedToOpenDocument)
 }
 
-fn load_document(path: &Path) -> Result<PdfDocument, WinPdfPrinterError> {
+pub(crate) fn load_document(path: &Path) -> Result<PdfDocument, WinPdfPrinterError> {
     let stream = open_document_stream(path)?;
     PdfDocument::LoadFromStreamAsync(&stream)
         .map_err(WinPdfPrinterError::FailedToOpenDocument)?
