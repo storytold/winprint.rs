@@ -19,7 +19,7 @@ use windows_sys::Win32::Graphics::Printing::{
     PRINTER_INFO_9W,
 };
 use windows_sys::Win32::Storage::Xps::{AbortDoc, DOCINFOW, EndDoc, EndPage, StartDocW, StartPage};
-use windows_sys::Win32::UI::ColorSystem::{ICM_DONE_OUTSIDEDC, ICM_OFF, SetICMMode};
+use windows_sys::Win32::UI::ColorSystem::{ICM_DONE_OUTSIDEDC, ICM_OFF, ICM_ON, SetICMMode};
 
 use crate::{
     ColorPolicy, DevMode, Job, Page, Primitive, PrintError, Printed, Printer, Result, RgbImage,
@@ -258,8 +258,9 @@ pub fn user_settings(printer: &str) -> Result<DevMode> {
     .ok_or_else(|| PrintError::System("the printer driver gave no settings".into()))
 }
 
-/// A printer device context, deleted on drop.
-struct Dc(HDC);
+/// A printer device context, deleted on drop, and whether the driver-validated settings it was
+/// created with ask for image color matching ([`DevMode::wants_icm`]).
+struct Dc(HDC, bool);
 
 impl Dc {
     fn create(printer: &str, settings: Option<&DevMode>, manual_copies: bool) -> Result<Self> {
@@ -308,7 +309,11 @@ impl Dc {
         if hdc.is_null() {
             return Err(last_error(&format!("opening printer “{printer}”")));
         }
-        Ok(Dc(hdc))
+        Ok(Dc(hdc, merged.as_ref().is_some_and(DevMode::wants_icm)))
+    }
+
+    fn wants_icm(&self) -> bool {
+        self.1
     }
 
     fn cap(&self, index: u32) -> i32 {
@@ -489,6 +494,11 @@ pub fn print(job: &Job<'_>, pages: &[crate::PagePicture<'_, '_>]) -> Result<Prin
         fwType: 0,
     };
     let color_mode = match job.color_policy {
+        // Follow the validated settings: with dmICMMethod System, Driver or Device they ask for
+        // the sRGB image to be color matched (System: GDI converts it through the printer's
+        // associated profile), and ICM_OFF would send its values unconverted. Settings asking
+        // for no matching keep ICM_OFF.
+        ColorPolicy::DriverManaged if dc.wants_icm() => ICM_ON,
         ColorPolicy::DriverManaged => ICM_OFF,
         // ICM_OFF enables old-style halftone correction. Pixels converted by the caller
         // need both DC conversion and that correction off (Microsoft SetICMMode contract).
