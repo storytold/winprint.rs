@@ -3,6 +3,8 @@
 //! Every `unsafe` block says why it is sound. Buffers the system writes into are `u64`-backed so
 //! the structures read from them are aligned.
 
+pub mod document;
+
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::HWND;

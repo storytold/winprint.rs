@@ -15,6 +15,10 @@
 #[allow(unsafe_code)]
 mod windows;
 
+mod document;
+
+pub use document::{Document, DocumentJob, MAX_IMAGE_BYTES, MAX_METAFILE_BYTES};
+
 use std::fmt;
 
 /// Why a printing call failed.
