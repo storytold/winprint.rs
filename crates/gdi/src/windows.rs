@@ -26,6 +26,8 @@ use crate::{
     Shape,
 };
 
+pub mod document;
+
 const IDOK: i32 = 1;
 const IDCANCEL: i32 = 2;
 /// Wide strings read from the system stop here at the latest.
