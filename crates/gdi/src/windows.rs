@@ -3,8 +3,6 @@
 //! Every `unsafe` block says why it is sound. Buffers the system writes into are `u64`-backed so
 //! the structures read from them are aligned.
 
-pub mod document;
-
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::HWND;
@@ -27,6 +25,8 @@ use crate::{
     ColorPolicy, DevMode, Job, Page, Primitive, PrintError, Printed, Printer, Result, RgbImage,
     Shape,
 };
+
+pub mod document;
 
 const IDOK: i32 = 1;
 const IDCANCEL: i32 = 2;

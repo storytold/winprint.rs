@@ -13,6 +13,7 @@ use windows_sys::Win32::Storage::Xps::{AbortDoc, DOCINFOW, EndDoc, EndPage, Star
 use windows_sys::Win32::UI::ColorSystem::{ICM_DONE_OUTSIDEDC, ICM_MODE, ICM_OFF, SetICMMode};
 
 use super::{Dc, aligned_copy, dib, last_error, properties, wide};
+use crate::document::check_device_rect;
 use crate::{ColorPolicy, DevMode, DocumentJob, Page, PrintError, Result, RgbImage};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -138,7 +139,8 @@ impl Doc {
 
     fn stretch(&mut self, image: &RgbImage<'_>, dest: (i32, i32, i32, i32)) -> Result<()> {
         let (x, y, w, h) = dest;
-        let (bmi, bits) = dib(image).map_err(|e| self.abort(e))?;
+        // A caller's image the job can't hold fails this call only; the job goes on.
+        let (bmi, bits) = dib(image)?;
         let mode = if crate::is_device_size(image, (w, h)) {
             COLORONCOLOR
         } else {
@@ -177,7 +179,7 @@ impl Doc {
 
     pub fn draw_image(&mut self, image: &RgbImage<'_>, rect: (f64, f64, f64, f64)) -> Result<()> {
         self.in_page()?;
-        let dest = crate::device_rect(&self.page, rect);
+        let dest = check_device_rect(crate::device_rect(&self.page, rect))?;
         self.stretch(image, dest)
     }
 
@@ -188,7 +190,7 @@ impl Doc {
 
     pub fn play_metafile(&mut self, emf: &[u8], rect: (f64, f64, f64, f64)) -> Result<()> {
         self.in_page()?;
-        let (x, y, w, h) = crate::device_rect(&self.page, rect);
+        let (x, y, w, h) = check_device_rect(crate::device_rect(&self.page, rect))?;
         let dest = RECT {
             left: x,
             top: y,
@@ -233,11 +235,12 @@ impl Doc {
         if self.state == State::Closed {
             return Err(closed());
         }
-        self.state = State::Closed;
         // SAFETY: closes the document started on this DC.
         if unsafe { EndDoc(self.dc.0) } <= 0 {
+            // Drop cancels the job, so it doesn't stay queued half sent.
             return Err(last_error("finishing the print job"));
         }
+        self.state = State::Closed;
         Ok(())
     }
 }
@@ -260,7 +263,7 @@ mod tests {
     /// of pixel bands, then a landscape page holding a metafile (needs that printer; run by hand,
     /// `WINPRINT_TEST_OUT` naming the output folder).
     #[test]
-    #[ignore]
+    #[ignore = "needs the Microsoft Print to PDF printer; run by hand"]
     fn streams_bands_and_a_metafile_through_a_real_driver() {
         let printer = "Microsoft Print to PDF";
         let dir =
@@ -314,11 +317,35 @@ mod tests {
             pdf.starts_with(b"%PDF") && pdf.len() > 1000,
             "the driver wrote a PDF"
         );
-        let pages = pdf
-            .windows(10)
-            .filter(|w| w == b"/Type/Page" || w == b"/Type /Pag")
+        // `/Type/Page` and not `/Type/Pages`, spaced or not.
+        let text = String::from_utf8_lossy(&pdf).replace("/Type /", "/Type/");
+        let pages = text
+            .match_indices("/Type/Page")
+            .filter(|(at, _)| !text[at + 10..].starts_with('s'))
             .count();
-        assert!(pages >= 2, "two pages, found {pages}");
+        assert_eq!(pages, 2, "one PDF page per page sent");
+        assert!(
+            text.contains("/Subtype/Image") || text.contains("/Subtype /Image"),
+            "the bands reach the file as a picture"
+        );
+        let boxes: Vec<Vec<f64>> = text
+            .match_indices("/MediaBox")
+            .filter_map(|(at, _)| {
+                let inside = text[at..].split_once('[')?.1.split_once(']')?.0;
+                Some(
+                    inside
+                        .split_whitespace()
+                        .filter_map(|n| n.parse().ok())
+                        .collect(),
+                )
+            })
+            .collect();
+        assert!(
+            boxes
+                .iter()
+                .any(|b| b.len() == 4 && b[2] - b[0] > b[3] - b[1]),
+            "the landscape page is wider than tall: {boxes:?}"
+        );
         if std::env::var("WINPRINT_TEST_OUT").is_err() {
             let _ = std::fs::remove_file(&out);
         }
@@ -326,7 +353,7 @@ mod tests {
 
     /// Dropping a job before it finishes cancels it, and calls on a page that was never begun fail.
     #[test]
-    #[ignore]
+    #[ignore = "needs the Microsoft Print to PDF printer; run by hand"]
     fn an_unfinished_job_is_cancelled() {
         let printer = "Microsoft Print to PDF";
         let dir =

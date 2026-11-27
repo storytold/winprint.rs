@@ -171,6 +171,18 @@ pub(crate) fn check_rect(rect: (f64, f64, f64, f64)) -> Result<()> {
     }
 }
 
+/// A destination of at least one device pixel each way. A rect that rounds to nothing is refused
+/// before any system call, so a caller's tiny rect fails that call and not the whole job.
+pub(crate) fn check_device_rect(dest: (i32, i32, i32, i32)) -> Result<(i32, i32, i32, i32)> {
+    if dest.2 > 0 && dest.3 > 0 {
+        Ok(dest)
+    } else {
+        Err(PrintError::Invalid(
+            "the print size is smaller than one printer dot".into(),
+        ))
+    }
+}
+
 /// An EMF the system will parse: it starts with a header record whose signature is right and
 /// whose stated file size is the length given.
 pub(crate) fn check_emf(emf: &[u8]) -> Result<()> {
@@ -287,6 +299,19 @@ pub(crate) mod tests {
         ] {
             assert!(check_rect(bad).is_err());
         }
+    }
+
+    #[test]
+    fn a_rect_under_one_printer_dot_is_refused() {
+        let page = crate::Page {
+            paper: (612.0, 792.0),
+            printable: (0.0, 0.0, 612.0, 792.0),
+            dpi: (72, 72),
+        };
+        let tiny = crate::device_rect(&page, (10.0, 10.0, 0.25, 40.0));
+        assert!(check_device_rect(tiny).is_err(), "{tiny:?}");
+        let dot = crate::device_rect(&page, (10.0, 10.0, 1.0, 1.0));
+        assert_eq!(check_device_rect(dot), Ok(dot));
     }
 
     #[cfg(not(windows))]
